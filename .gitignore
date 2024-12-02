@@ -45,3 +45,5 @@ Scripts/dados/
 Scripts/csvs_processed/
 Scripts/csvs_treated/
 Scripts/temp_extracted_files/
+Scripts/all_data/
+BACKUP/
