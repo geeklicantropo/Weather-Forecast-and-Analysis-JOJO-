@@ -18,8 +18,8 @@ logging.basicConfig(
 
 # Paths
 base_dir = os.path.dirname(os.path.abspath(__file__))
-processed_folder = os.path.join(base_dir, 'csvs_processed')
-optimized_folder = os.path.join(base_dir, 'csvs_treated')
+processed_folder = os.path.join(base_dir, 'all_data/csvs_processed')
+optimized_folder = os.path.join(base_dir, 'all_data/csvs_treated')
 
 # Ensure the optimized folder exists
 os.makedirs(optimized_folder, exist_ok=True)
