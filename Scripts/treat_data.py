@@ -8,13 +8,14 @@ base_dir = './Scripts/all_data'
 processed_folder = os.path.join(base_dir, 'csvs_processed')  # Source folder
 treated_folder = os.path.join(base_dir, 'csvs_treated')     # Destination folder
 
-# Ensure the 'csvs_treated' folder exists
+#processed_folder = os.path.join(base_dir, 'TESTES/nao_alterado')
+#treated_folder = os.path.join(base_dir, 'TESTES/alterado')
+
+# Ensure the destination folder exists
 os.makedirs(treated_folder, exist_ok=True)
 
 # Data type mapping
 dtype_mapping = {
-    'DATA': 'datetime64[ns]',
-    'HORA': 'string',
     'PRECIPITACAO TOTAL HORARIO MM': 'float32',
     'PRESSAO ATMOSFERICA AO NIVEL DA ESTACAO HORARIA MB': 'float32',
     'PRESSAO ATMOSFERICA MAX. NA HORA ANT. AUT MB': 'float32',
@@ -44,17 +45,25 @@ dtype_mapping = {
 }
 
 def detect_delimiter(file_path):
+    """Detect the delimiter of a CSV file."""
     with open(file_path, 'r', encoding='utf-8') as f:
-        sample = f.read(2048)  # Read a small sample of the file
+        sample = f.read(2048)
         sniffer = csv.Sniffer()
         try:
             delimiter = sniffer.sniff(sample).delimiter
             return delimiter
         except csv.Error:
-            return ','  # Default to comma if detection fails
-        
+            return ','
+
+def preprocess_and_convert_floats(df):
+    """Replace commas with dots in numeric columns."""
+    for col in df.select_dtypes(include=['object']).columns:
+        if df[col].notna().any():  # Only process columns with non-null values
+            df[col] = df[col].astype(str).str.replace(',', '.', regex=False)
+    return df
+
 def process_csv_files():
-    """Process each CSV file to reduce size and save them in 'csvs_treated'."""
+    """Process each CSV file to reduce size and save them in treated folder."""
     csv_files = [f for f in os.listdir(processed_folder) if f.lower().endswith('.csv')]
 
     for csv_file in tqdm(csv_files, desc="Processing CSV files"):
@@ -63,56 +72,64 @@ def process_csv_files():
             output_filename = os.path.splitext(csv_file)[0] + '.csv.gz'
             output_path = os.path.join(treated_folder, output_filename)
 
-            # Detect delimiter
+            # Read CSV with detected delimiter
             delimiter = detect_delimiter(input_path)
-            df = pd.read_csv(input_path, sep=delimiter, dtype=str, encoding='utf-8')
+            df = pd.read_csv(
+                input_path,
+                sep=delimiter,
+                dtype=str,  # Load everything as string initially
+                encoding='utf-8'
+            )
 
             # Normalize column names
             df.columns = df.columns.str.upper()
 
-            # Remove "Unnamed" columns
-            unnamed_cols = [col for col in df.columns if col.startswith("UNNAMED")]
-            df.drop(columns=unnamed_cols, inplace=True)
+            # Remove unnamed columns
+            unnamed_cols = [col for col in df.columns if 'UNNAMED' in col.upper()]
+            if unnamed_cols:
+                df = df.drop(columns=unnamed_cols)
 
-            # Replace commas with dots in all data (string level)
-            df = df.replace(',', '.', regex=True)
+            # Preprocess numeric columns (replace commas with dots)
+            df = preprocess_and_convert_floats(df)
 
-            # Process and convert data types
+            # Process DATA column
+            if 'DATA' in df.columns:
+                df['DATA'] = pd.to_datetime(df['DATA'], format='%Y/%m/%d', errors='coerce').dt.strftime('%Y-%m-%d')
+
+            # Process HORA UTC column
+            if 'HORA UTC' in df.columns:
+                df['HORA UTC'] = pd.to_numeric(
+                    df['HORA UTC'].astype(str).str.extract(r'(\d{4})')[0].str[:2], 
+                    errors='coerce'
+                ).astype('Int32')
+
+            # Convert data types according to mapping
             for col in df.columns:
-                col_upper = col.upper()
-                if col_upper in dtype_mapping:
-                    target_type = dtype_mapping[col_upper]
-                    if target_type == 'float32':
-                        df[col] = pd.to_numeric(df[col], errors='coerce').astype('float32')
-                    elif target_type == 'Int32':
-                        df[col] = pd.to_numeric(df[col], errors='coerce').astype('Int32')
-                    elif target_type == 'datetime64[ns]':
-                        df[col] = pd.to_datetime(df[col], errors='coerce', dayfirst=True)
-                    elif target_type == 'string':
-                        df[col] = df[col].astype('string')
+                if col in dtype_mapping:
+                    try:
+                        if dtype_mapping[col] == 'float32':
+                            df[col] = pd.to_numeric(df[col], errors='coerce').astype('float32')
+                        elif dtype_mapping[col] == 'Int32':
+                            df[col] = pd.to_numeric(df[col], errors='coerce').astype('Int32')
+                        elif dtype_mapping[col] == 'string':
+                            df[col] = df[col].astype('string')
+                        elif dtype_mapping[col] == 'datetime64[ns]':
+                            df[col] = pd.to_datetime(df[col], errors='coerce')
+                    except Exception as e:
+                        print(f"Error converting column {col}: {str(e)}")
 
-            # Enforce downcast to reduce precision for all numeric types
-            for col in df.select_dtypes(include=['float64']).columns:
-                df[col] = pd.to_numeric(df[col], downcast='float')
-            for col in df.select_dtypes(include=['int64']).columns:
-                df[col] = pd.to_numeric(df[col], downcast='integer')
-
-            # Verify column types
-            #print(f"Final types for file {csv_file}:")
-            #print(df.dtypes)
-
-            # Write the DataFrame to a compressed CSV file
+            # Save processed file
             df.to_csv(
                 output_path,
-                index=False,         # Do not write row indices
-                sep=',',             # Use commas as delimiters
-                quoting=csv.QUOTE_MINIMAL,  # Quote only fields with special characters
-                compression='gzip',  # Compress the output
-                encoding='utf-8'     # UTF-8 encoding
+                index=False,
+                compression='gzip',
+                quoting=csv.QUOTE_MINIMAL,
+                encoding='utf-8'
             )
 
         except Exception as e:
-            print(f"Error processing file {csv_file}: {e}")
+            print(f"Error processing file {csv_file}: {str(e)}")
+            raise  # Re-raise the exception to see the full error traceback
 
 if __name__ == '__main__':
     process_csv_files()
