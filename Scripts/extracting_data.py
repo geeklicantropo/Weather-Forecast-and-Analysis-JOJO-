@@ -179,7 +179,8 @@ for zip_filename in sorted(os.listdir(data_folder)):
                             data[col] = val
 
                         # Remove colunas 'Unnamed'
-                        data = data.loc[:, ~data.columns.str.contains('^Unnamed')]
+                        data = data.loc[:, ~data.columns.str.startswith('Unnamed')]
+
 
                         # Define os tipos de dados
                         for col, dtype in tipos.items():
@@ -189,8 +190,6 @@ for zip_filename in sorted(os.listdir(data_folder)):
                         data['YEAR'] = int(year)
                         # Salva no CSV
                         data.to_csv(output_csv_path, index=False)
-
-                        
 
                         # Limpa a memória para cada CSV processado
                         del data
