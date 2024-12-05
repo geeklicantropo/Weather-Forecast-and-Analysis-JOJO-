@@ -1,15 +1,17 @@
 # src/data_processing/preprocessor.py
 import numpy as np
 import dask.dataframe as dd
-from dask.diagnostics import ProgressBar
-from datetime import datetime, timedelta
+import cudf
+import dask_cudf
+from scipy import stats
 
 class DataPreprocessor:
-    def __init__(self, target_variable="TEMPERATURA DO AR - BULBO SECO HORARIA °C"):
+    def __init__(self, target_variable, logger):
         self.target_variable = target_variable
+        self.logger = logger
         self.essential_columns = [
             'DATETIME',
-            'TEMPERATURA DO AR - BULBO SECO HORARIA °C',
+            self.target_variable,
             'PRECIPITACÃO TOTAL HORÁRIO MM',
             'PRESSAO ATMOSFERICA AO NIVEL DA ESTACAO HORARIA MB',
             'RADIACAO GLOBAL KJ/M²',
@@ -20,102 +22,105 @@ class DataPreprocessor:
             'ALTITUDE'
         ]
     
-    def preprocess(self, df):
-        """Enhanced preprocessing with climate-specific handling."""
-        # Replace -9999.0 with NaN and handle other invalid values
-        df = df.map_partitions(self._clean_invalid_values)
+    def preprocess(self, df, use_gpu=False):
+        """Main preprocessing pipeline"""
+        self.logger.log_info("Starting preprocessing")
         
-        # Select and rename columns for clarity
-        df = df[self.essential_columns]
+        try:
+            # Replace invalid values
+            df = self._replace_invalid_values(df, use_gpu)
+            
+            # Remove outliers
+            df = self._handle_outliers(df, use_gpu)
+            
+            # Select essential columns
+            df = df[self.essential_columns]
+            
+            # Sort and set index
+            df = df.set_index('DATETIME').sort_index()
+            
+            return df
+            
+        except Exception as e:
+            self.logger.log_error(f"Preprocessing failed: {str(e)}")
+            raise
+    
+    def _replace_invalid_values(self, df, use_gpu):
+        """Replace invalid values with NaN"""
+        invalid_values = [-9999.0, -999.0, -99.0, 9999.0]
         
-        # Convert to daily frequency for climate analysis
-        df = self._resample_to_daily(df)
-        
-        # Add quality flags
-        df = self._add_quality_flags(df)
+        if use_gpu:
+            for val in invalid_values:
+                df = df.map_partitions(lambda x: x.replace(val, cudf.NA))
+        else:
+            for val in invalid_values:
+                df = df.map_partitions(lambda x: x.replace(val, np.nan))
         
         return df
     
-    def _clean_invalid_values(self, df):
-        """Clean invalid values with climate-specific thresholds."""
-        df = df.replace(-9999.0, np.nan)
+    def _handle_outliers(self, df, use_gpu):
+        """Remove statistical outliers"""
+        def remove_outliers(x):
+            if use_gpu:
+                z_scores = (x - x.mean()) / x.std()
+                return x.mask(abs(z_scores) > 3)
+            else:
+                z_scores = stats.zscore(x)
+                return x.mask(abs(z_scores) > 3)
         
-        # Temperature constraints (in Celsius)
-        df.loc[df[self.target_variable] < -40, self.target_variable] = np.nan
-        df.loc[df[self.target_variable] > 50, self.target_variable] = np.nan
+        numeric_columns = [
+            self.target_variable,
+            'PRECIPITACÃO TOTAL HORÁRIO MM',
+            'PRESSAO ATMOSFERICA AO NIVEL DA ESTACAO HORARIA MB',
+            'RADIACAO GLOBAL KJ/M²'
+        ]
         
-        # Pressure constraints (in MB)
-        pressure_col = 'PRESSAO ATMOSFERICA AO NIVEL DA ESTACAO HORARIA MB'
-        df.loc[df[pressure_col] < 800, pressure_col] = np.nan
-        df.loc[df[pressure_col] > 1100, pressure_col] = np.nan
-        
-        # Humidity constraints (in %)
-        humidity_col = 'UMIDADE RELATIVA DO AR HORARIA %'
-        df.loc[df[humidity_col] < 0, humidity_col] = np.nan
-        df.loc[df[humidity_col] > 100, humidity_col] = np.nan
+        for col in numeric_columns:
+            df[col] = df[col].map_partitions(remove_outliers)
         
         return df
     
-    def _resample_to_daily(self, df):
-        """Resample hourly data to daily frequency with appropriate aggregations."""
-        agg_dict = {
-            self.target_variable: {
-                'mean_temp': 'mean',
-                'max_temp': 'max',
-                'min_temp': 'min',
-                'temp_range': lambda x: x.max() - x.min()
-            },
-            'PRECIPITACÃO TOTAL HORÁRIO MM': 'sum',
-            'PRESSAO ATMOSFERICA AO NIVEL DA ESTACAO HORARIA MB': 'mean',
-            'RADIACAO GLOBAL KJ/M²': 'sum',
-            'UMIDADE RELATIVA DO AR HORARIA %': 'mean',
-            'VENTO VELOCIDADE HORARIA M/S': 'mean'
-        }
-        
-        return df.resample('D').agg(agg_dict)
-    
-    def _add_quality_flags(self, df):
-        """Add quality control flags for climate data."""
-        def add_flags(df):
-            # Flag for rapid temperature changes
-            df['temp_change'] = df[self.target_variable].diff()
-            df['rapid_temp_change'] = abs(df['temp_change']) > 10
-            
-            # Flag for long periods of constant values
-            df['constant_temp'] = (df[self.target_variable] == 
-                                 df[self.target_variable].shift()).rolling(24).sum() >= 23
-            
-            # Flag for suspicious daily temperature ranges
-            df['suspicious_range'] = df['temp_range'] > 30
-            
+    def handle_missing_values(self, df, use_gpu=False):
+        """Enhanced missing value handling for climate data"""
+        def process_partition(df):
+            # Handle different time gaps
+            df = self._handle_small_gaps(df)
+            df = self._handle_medium_gaps(df)
+            df = self._handle_large_gaps(df)
             return df
         
-        return df.map_partitions(add_flags)
+        return df.map_partitions(process_partition)
     
-    def handle_missing_values(self, df):
-        """Enhanced missing value handling for climate data."""
-        def climate_interpolation(df):
-            # Short gaps: Linear interpolation (up to 6 hours)
-            df = df.interpolate(method='linear', limit=6)
-            
-            # Medium gaps: Use daily cycle (6-24 hours)
-            daily_pattern = df[self.target_variable].groupby(df.index.hour).mean()
-            
-            for col in df.columns:
-                if df[col].isna().any():
-                    # Use seasonal patterns for longer gaps
-                    seasonal_pattern = (
-                        df[col]
-                        .groupby([df.index.month, df.index.hour])
-                        .mean()
-                    )
-                    
-                    # Fill remaining gaps with seasonal patterns
-                    df[col] = df[col].fillna(
-                        df.groupby([df.index.month, df.index.hour])
-                        .transform(lambda x: x.fillna(x.mean()))
-                    )
-            
-            return df
+    def _handle_small_gaps(self, df, max_hours=6):
+        """Handle gaps ≤ 6 hours using forward fill"""
+        return df.fillna(method='ffill', limit=max_hours)
+    
+    def _handle_medium_gaps(self, df, max_hours=24):
+        """Handle gaps ≤ 24 hours using interpolation"""
+        # Linear interpolation for temperature and pressure
+        temp_pressure_cols = [
+            self.target_variable,
+            'PRESSAO ATMOSFERICA AO NIVEL DA ESTACAO HORARIA MB'
+        ]
         
-        return df.map_partitions(climate_interpolation)
+        for col in temp_pressure_cols:
+            df[col] = df[col].interpolate(method='linear', limit=max_hours)
+        
+        # Seasonal interpolation for other variables
+        other_cols = [col for col in df.columns if col not in temp_pressure_cols]
+        for col in other_cols:
+            df[col] = df[col].interpolate(method='time', limit=max_hours)
+        
+        return df
+    
+    def _handle_large_gaps(self, df):
+        """Handle gaps > 24 hours using seasonal patterns"""
+        def seasonal_fill(series):
+            # Get seasonal pattern
+            if len(series) > 24*7:  # Need at least a week of data
+                seasonal_pattern = series.groupby(series.index.hour).mean()
+                filled = series.fillna(seasonal_pattern[series.index.hour])
+                return filled
+            return series
+        
+        return df.apply(seasonal_fill)
