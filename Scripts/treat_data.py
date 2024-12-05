@@ -5,6 +5,10 @@ import csv
 
 # Paths
 base_dir = './Scripts/all_data'
+
+#processed_folder = os.path.join(base_dir, 'TESTES/nao_alterado')
+#treated_folder = os.path.join(base_dir, 'TESTES/alterado')
+
 processed_folder = os.path.join(base_dir, 'csvs_processed')
 treated_folder = os.path.join(base_dir, 'csvs_treated')
 
@@ -53,6 +57,31 @@ def preprocess_and_convert_floats(df):
             df[col] = df[col].astype(str).str.replace(',', '.', regex=False)
     return df
 
+def process_hora_utc(hora_str):
+    """
+    Processa string de hora UTC para extrair apenas a hora (primeiros 2 dígitos)
+    Trata múltiplos formatos:
+    - "0000 UTC" -> "00"
+    - "00:00" -> "00"
+    - Outros formatos similares
+    """
+    try:
+        # Primeiro tenta o padrão HH:MM
+        if ':' in str(hora_str):
+            return pd.to_numeric(str(hora_str).split(':')[0], errors='coerce')
+        
+        # Depois tenta o padrão HHMM UTC
+        hora_digits = ''.join(filter(str.isdigit, str(hora_str)))
+        if len(hora_digits) >= 2:
+            return pd.to_numeric(hora_digits[:2], errors='coerce')
+        
+        # Se chegou aqui, nenhum padrão foi reconhecido
+        raise ValueError(f"Formato de hora não reconhecido: {hora_str}")
+        
+    except Exception as e:
+        print(f"Erro ao processar hora UTC '{hora_str}': {str(e)}")
+        raise
+
 def process_csv_files():
     """Process each CSV file to reduce size and save them in treated folder."""
     csv_files = [f for f in os.listdir(processed_folder) if f.lower().endswith('.csv')]
@@ -73,7 +102,13 @@ def process_csv_files():
                 raise FileNotFoundError(f"Arquivo de entrada não encontrado: {input_path}")
             
             # Ler CSV
-            df = pd.read_csv(input_path, sep=',', dtype=str, encoding='utf-8')
+            try:
+                df = pd.read_csv(input_path, sep=',', dtype=str, encoding='utf-8')
+            except UnicodeDecodeError:
+                try:
+                    df = pd.read_csv(input_path, sep=',', dtype=str, encoding='latin1')
+                except UnicodeDecodeError:
+                    df = pd.read_csv(input_path, sep=',', dtype=str, encoding='iso-8859-1')
             #print(f"Arquivo lido com sucesso. Shape inicial: {df.shape}")
             
             # Processar DataFrame
@@ -94,11 +129,9 @@ def process_csv_files():
                 #print("Coluna DATA processada")
 
             # Processar coluna HORA UTC
+            # Processar coluna HORA UTC
             if 'HORA UTC' in df.columns:
-                df['HORA UTC'] = pd.to_numeric(
-                    df['HORA UTC'].astype(str).str.extract(r'(\d{4})')[0].str[:2], 
-                    errors='coerce'
-                ).astype('Int32')
+                df['HORA UTC'] = df['HORA UTC'].apply(process_hora_utc).astype('Int32')
                 #print("Coluna HORA UTC processada")
 
             # Converter tipos de dados
