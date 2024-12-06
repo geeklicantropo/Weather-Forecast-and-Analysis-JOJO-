@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import logging
 from scipy import stats
 from datetime import datetime, timedelta
-from ...src.utils.config_manager import ConfigManager
+from src.utils.config_manager import ConfigManager
 
 @dataclass
 class ValidationReport:

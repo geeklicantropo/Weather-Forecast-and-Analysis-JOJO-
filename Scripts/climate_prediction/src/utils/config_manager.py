@@ -6,7 +6,7 @@ import logging
 from datetime import datetime
 
 class ConfigManager:
-    def __init__(self, config_path: str = "config/model_config.yaml"):
+    def __init__(self, config_path: str = "./config/model_config.yaml"):
         self.config_path = config_path
         self.config = self._load_config()
         self._validate_config()

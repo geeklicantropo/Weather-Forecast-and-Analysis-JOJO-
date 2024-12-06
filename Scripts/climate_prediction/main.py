@@ -26,9 +26,11 @@ from src.visualization.visualization_manager import VisualizationManager
 
 class ClimateModelPipeline:
     def __init__(self, config_path: str = "config/model_config.yaml"):
+        # Convert config_path to absolute path
+        self.config_path = os.path.join(project_root, config_path)
         self.setup_directories()
         self.logger = ProgressLogger(name="ClimateModelPipeline")
-        self.config_manager = ConfigManager(config_path)
+        self.config_manager = ConfigManager(self.config_path)
         self.config = self.config_manager.get_config()
         self.visualizer = VisualizationManager(self.logger)
         
@@ -251,9 +253,9 @@ class ClimateModelPipeline:
             raise
 
 def main():
-    # Parse command line arguments if needed
+    # Update config path to match project structure
+    config_path = "./config/model_config.yaml"
     data_path = './Scripts/all_data/csvs_concatenated/concatenated_full/full_concatenated.csv.gz'
-    config_path = "config/model_config.yaml"
     
     try:
         # Initialize and run pipeline

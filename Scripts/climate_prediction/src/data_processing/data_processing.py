@@ -4,7 +4,8 @@ import dask.dataframe as dd
 from datetime import datetime
 import json
 from tqdm import tqdm
-from src.data_processing.preprocessor import DataPreprocessor
+
+from src.data_processing.preprocessor import ClimateDataPreprocessor
 from src.data_processing.feature_engineering import FeatureEngineer
 from src.data_processing.data_validator import DataValidator
 from src.data_processing.data_versioning import DataVersioning
@@ -19,7 +20,7 @@ class DataProcessingPipeline:
     def _initialize_components(self):
         """Initialize pipeline components."""
         try:
-            self.preprocessor = DataPreprocessor(self.target_variable)
+            self.preprocessor = ClimateDataPreprocessor(self.target_variable)
             self.feature_engineer = FeatureEngineer(self.target_variable)
             self.validator = DataValidator()
             self.versioning = DataVersioning()
