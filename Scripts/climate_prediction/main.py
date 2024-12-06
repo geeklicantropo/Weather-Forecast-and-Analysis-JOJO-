@@ -1,117 +1,277 @@
-# climate_prediction/main.py
 import os
+import sys
+from pathlib import Path
 import logging
 import pandas as pd
+import numpy as np
 from datetime import datetime
 import json
-from src.data_processing.data_processing import DataProcessingPipeline
-from src.models.model_trainer import ModelTrainer
+import yaml
+from tqdm import tqdm
+import torch
 import warnings
 warnings.filterwarnings('ignore')
 
-def setup_directories():
-    """Create necessary project directories."""
-    directories = [
-        'outputs/data',
-        'outputs/models',
-        'outputs/plots',
-        'outputs/logs',
-        'outputs/predictions',
-        'outputs/metrics',
-        'config'
-    ]
-    for directory in directories:
-        os.makedirs(directory, exist_ok=True)
+# Add project root to path
+project_root = Path(__file__).parent
+sys.path.append(str(project_root))
 
-def setup_logging():
-    """Setup logging configuration."""
-    log_filename = f'outputs/logs/pipeline_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(log_filename),
-            logging.StreamHandler()
+from src.data_processing.data_processing import DataProcessingPipeline
+from src.data_processing.data_loader import DataLoader
+from src.models.train_evaluate import ModelTrainEvaluate
+from src.utils.logger import ProgressLogger
+from src.utils.config_manager import ConfigManager
+from src.utils.gpu_manager import gpu_manager
+from src.visualization.visualization_manager import VisualizationManager
+
+class ClimateModelPipeline:
+    def __init__(self, config_path: str = "config/model_config.yaml"):
+        self.setup_directories()
+        self.logger = ProgressLogger(name="ClimateModelPipeline")
+        self.config_manager = ConfigManager(config_path)
+        self.config = self.config_manager.get_config()
+        self.visualizer = VisualizationManager(self.logger)
+        
+        # Initialize GPU if available
+        self.device = gpu_manager.get_device()
+        if torch.cuda.is_available():
+            self.logger.log_info(f"Using GPU: {torch.cuda.get_device_name(0)}")
+            gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
+            self.logger.log_info(f"GPU Memory: {gpu_memory:.2f} GB")
+        else:
+            self.logger.log_info("Using CPU")
+    
+    def setup_directories(self):
+        """Create all necessary directories."""
+        directories = [
+            'outputs/data',
+            'outputs/models',
+            'outputs/plots',
+            'outputs/logs',
+            'outputs/predictions',
+            'outputs/metrics',
+            'outputs/metadata',
+            'config'
         ]
-    )
+        for directory in directories:
+            os.makedirs(directory, exist_ok=True)
+    
+    def load_and_process_data(self, data_path: str) -> pd.DataFrame:
+        """Load and process the climate data."""
+        try:
+            self.logger.log_info("Starting data loading and processing...")
+            
+            # Initialize data loader
+            data_loader = DataLoader(data_path, self.logger)
+            
+            # Load data with progress tracking
+            with tqdm(desc="Loading data", unit="steps") as pbar:
+                df = data_loader.load_data()
+                pbar.update(1)
+            
+            # Initialize data processing pipeline
+            pipeline = DataProcessingPipeline(
+                self.config['preprocessing']['target_variable'],
+                self.logger
+            )
+            
+            # Process data with progress tracking
+            with tqdm(desc="Processing data", unit="steps") as pbar:
+                df, version_info = pipeline.run_pipeline(df)
+                pbar.update(1)
+            
+            # Save processed data
+            output_path = 'outputs/data/processed_data.parquet'
+            df.to_parquet(output_path)
+            
+            # Save version info
+            version_path = f'outputs/metadata/data_version_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json'
+            with open(version_path, 'w') as f:
+                json.dump(version_info, f, indent=4)
+            
+            self.logger.log_info(f"Data processing completed. Shape: {df.shape}")
+            return df
+            
+        except Exception as e:
+            self.logger.log_error(f"Error in data loading and processing: {str(e)}")
+            raise
+    
+    def train_and_evaluate_models(self, df: pd.DataFrame) -> dict:
+        """Train and evaluate all models."""
+        try:
+            self.logger.log_info("Starting model training and evaluation...")
+            
+            # Initialize training pipeline
+            train_evaluate = ModelTrainEvaluate(
+                config_path=self.config_manager.config_path
+            )
+            
+            # Run training and evaluation pipeline
+            with tqdm(desc="Training and evaluating models", unit="steps") as pbar:
+                results = train_evaluate.run_pipeline(df)
+                pbar.update(1)
+            
+            self.logger.log_info("Model training and evaluation completed")
+            return results
+            
+        except Exception as e:
+            self.logger.log_error(f"Error in model training and evaluation: {str(e)}")
+            raise
+    
+    def generate_visualizations(self, df: pd.DataFrame, results: dict):
+        """Generate all required visualizations."""
+        try:
+            self.logger.log_info("Generating visualizations...")
+            
+            # Time series decomposition
+            with tqdm(desc="Generating visualizations", total=5) as pbar:
+                self.visualizer.plot_components(
+                    df[self.config['preprocessing']['target_variable']]
+                )
+                pbar.update(1)
+                
+                # Model predictions comparison
+                self.visualizer.plot_predictions(
+                    df[self.config['preprocessing']['target_variable']],
+                    results['evaluation_results']
+                )
+                pbar.update(1)
+                
+                # Model metrics comparison
+                metrics_df = pd.DataFrame({
+                    name: res['metrics']
+                    for name, res in results['evaluation_results'].items()
+                })
+                self.visualizer.plot_metrics_comparison(metrics_df)
+                pbar.update(1)
+                
+                # Forecast horizon plots
+                self.visualizer.plot_forecast_horizon(
+                    df[self.config['preprocessing']['target_variable']],
+                    results['future_predictions'],
+                    forecast_start=df.index[-1]
+                )
+                pbar.update(1)
+                
+                # Feature importance plots (if available)
+                if 'feature_importance' in results:
+                    self.visualizer.plot_feature_importance(
+                        results['feature_importance']
+                    )
+                pbar.update(1)
+            
+            self.logger.log_info("Visualization generation completed")
+            
+        except Exception as e:
+            self.logger.log_error(f"Error generating visualizations: {str(e)}")
+            raise
+    
+    def save_results(self, results: dict):
+        """Save all results and metadata."""
+        try:
+            self.logger.log_info("Saving results...")
+            
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            
+            # Save evaluation metrics
+            metrics_path = f'outputs/metrics/final_metrics_{timestamp}.json'
+            with open(metrics_path, 'w') as f:
+                json.dump(
+                    {name: res['metrics'] 
+                     for name, res in results['evaluation_results'].items()},
+                    f, indent=4
+                )
+            
+            # Save predictions
+            for model_name, predictions in results['future_predictions'].items():
+                pred_path = f'outputs/predictions/{model_name}_predictions_{timestamp}.csv'
+                predictions.to_csv(pred_path)
+            
+            # Save execution metadata
+            metadata = {
+                'timestamp': timestamp,
+                'config_used': self.config,
+                'model_performance': {
+                    name: res['metrics']
+                    for name, res in results['evaluation_results'].items()
+                },
+                'training_duration': {
+                    name: hist.get('training_time', None)
+                    for name, hist in results['training_histories'].items()
+                }
+            }
+            
+            metadata_path = f'outputs/metadata/execution_metadata_{timestamp}.json'
+            with open(metadata_path, 'w') as f:
+                json.dump(metadata, f, indent=4)
+            
+            self.logger.log_info("Results saved successfully")
+            
+        except Exception as e:
+            self.logger.log_error(f"Error saving results: {str(e)}")
+            raise
+    
+    def run_pipeline(self, data_path: str):
+        """Execute the complete modeling pipeline."""
+        try:
+            self.logger.log_info("Starting climate modeling pipeline...")
+            start_time = datetime.now()
+            
+            # Load and process data
+            df = self.load_and_process_data(data_path)
+            
+            # Train and evaluate models
+            results = self.train_and_evaluate_models(df)
+            
+            # Generate visualizations
+            self.generate_visualizations(df, results)
+            
+            # Save results
+            self.save_results(results)
+            
+            end_time = datetime.now()
+            duration = end_time - start_time
+            
+            self.logger.log_info(f"Pipeline completed successfully in {duration}")
+            
+            # Return summary of results
+            return {
+                'status': 'success',
+                'duration': str(duration),
+                'data_shape': df.shape,
+                'models_trained': list(results['evaluation_results'].keys()),
+                'best_model': min(
+                    results['evaluation_results'].items(),
+                    key=lambda x: x[1]['metrics']['rmse']
+                )[0]
+            }
+            
+        except Exception as e:
+            self.logger.log_error(f"Pipeline failed: {str(e)}")
+            raise
 
 def main():
-    # Setup
-    setup_directories()
-    setup_logging()
-    logging.info("Starting climate prediction pipeline...")
+    # Parse command line arguments if needed
+    data_path = './Scripts/all_data/csvs_concatenated/concatenated_full/full_concatenated.csv.gz'
+    config_path = "config/model_config.yaml"
     
     try:
-        # Initialize data processing pipeline
-        data_path = './Scripts/all_data/csvs_concatenated/concatenated_full/full_concatenated.csv.gz'
-        pipeline = DataProcessingPipeline(data_path)
+        # Initialize and run pipeline
+        pipeline = ClimateModelPipeline(config_path)
+        summary = pipeline.run_pipeline(data_path)
         
-        # Process data
-        logging.info("Processing data...")
-        df, version_info = pipeline.run_pipeline()
-        
-        # Split data chronologically into train, validation, and test sets
-        logging.info("Splitting data...")
-        total_days = (df.index.max() - df.index.min()).days
-        train_end = df.index.min() + pd.Timedelta(days=int(total_days * 0.7))
-        val_end = train_end + pd.Timedelta(days=int(total_days * 0.15))
-        
-        train_data = df[df.index <= train_end]
-        val_data = df[(df.index > train_end) & (df.index <= val_end)]
-        test_data = df[df.index > val_end]
-        
-        logging.info(f"Train data shape: {train_data.shape}, from {train_data.index.min()} to {train_data.index.max()}")
-        logging.info(f"Validation data shape: {val_data.shape}, from {val_data.index.min()} to {val_data.index.max()}")
-        logging.info(f"Test data shape: {test_data.shape}, from {test_data.index.min()} to {test_data.index.max()}")
-        
-        # Initialize model trainer
-        trainer = ModelTrainer()
-        trainer.initialize_models()
-        
-        # Train models
-        logging.info("Training models...")
-        training_histories = trainer.train_models(train_data, val_data)
-        
-        # Evaluate models
-        logging.info("Evaluating models...")
-        evaluation_results = trainer.evaluate_models(test_data)
-        
-        # Select best model
-        best_model = trainer.select_best_model(evaluation_results)
-        logging.info(f"Best performing model: {best_model}")
-        
-        # Generate future predictions
-        logging.info("Generating future predictions...")
-        future_predictions = trainer.generate_future_predictions(test_data, years=10)
-        
-        # Save final results
-        results = {
-            'evaluation_results': evaluation_results,
-            'best_model': best_model,
-            'data_version': version_info,
-            'training_timestamp': datetime.now().isoformat()
-        }
-        
-        results_path = f'outputs/metrics/final_results_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json'
-        with open(results_path, 'w') as f:
-            json.dump(results, f, indent=4)
-        
-        logging.info(f"Results saved to {results_path}")
-        
-        # Print final results
-        print("\nFinal Results:")
-        for model_name, metrics in evaluation_results.items():
-            print(f"\n{model_name.upper()} Metrics:")
-            for metric_name, value in metrics.items():
-                print(f"{metric_name}: {value:.4f}")
-        
-        print(f"\nBest Model: {best_model.upper()}")
+        # Print final summary
+        print("\nPipeline Execution Summary:")
+        print("==========================")
+        print(f"Status: {summary['status']}")
+        print(f"Duration: {summary['duration']}")
+        print(f"Data Shape: {summary['data_shape']}")
+        print(f"Models Trained: {', '.join(summary['models_trained'])}")
+        print(f"Best Performing Model: {summary['best_model']}")
         
     except Exception as e:
-        logging.error(f"Pipeline failed: {str(e)}")
+        logging.error(f"Pipeline execution failed: {str(e)}")
         raise
-    
-    logging.info("Pipeline completed successfully!")
 
 if __name__ == "__main__":
     main()
