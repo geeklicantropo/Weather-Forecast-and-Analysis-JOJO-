@@ -6,8 +6,8 @@ from torch.utils.data import DataLoader, TensorDataset
 from sklearn.preprocessing import MinMaxScaler
 import joblib
 import pandas as pd
-from .base_model import BaseModel
-from ..utils.gpu_manager import gpu_manager
+from src.models.base_model import BaseModel
+from src.utils.gpu_manager import gpu_manager
 
 class LSTMNet(nn.Module):
     def __init__(self, input_size, hidden_size, num_layers, output_size=1):

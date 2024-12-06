@@ -7,7 +7,7 @@ from sklearn.model_selection import TimeSeriesSplit
 import itertools
 import joblib
 from concurrent.futures import ProcessPoolExecutor
-from .base_model import BaseModel
+from src.models.base_model import BaseModel
 
 class SARIMAModel(BaseModel):
     def __init__(self, target_variable, logger, order_ranges=None, seasonal_order_ranges=None):

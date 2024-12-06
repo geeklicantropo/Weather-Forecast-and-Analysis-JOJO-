@@ -6,8 +6,8 @@ import dask_cudf
 from datetime import datetime
 import psutil
 import torch
-from ..utils.logger import log_execution_time
-from ..utils.gpu_manager import GPUManager
+from src.utils.logger import log_execution_time
+from src.utils.gpu_manager import GPUManager
 
 class DataLoader:
     def __init__(self, data_path, logger):

@@ -1,0 +1,26 @@
+data_processing:
+  chunk_size: 100000
+  validation_threshold: 0.2
+  gpu_memory_fraction: 0.8
+
+models:
+  lstm:
+    sequence_length: 30
+    hidden_size: 50
+    num_layers: 2
+    dropout: 0.1
+    
+  sarima:
+    order: [1, 1, 1]
+    seasonal_order: [1, 1, 1, 24]
+    
+  tft:
+    max_encoder_length: 720  # 30 days
+    hidden_size: 32
+    attention_head_size: 4
+    dropout: 0.1
+
+visualization:
+  dpi: 300
+  style: 'seaborn-whitegrid'
+  format: ['png', 'html']

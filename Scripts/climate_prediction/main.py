@@ -1,9 +1,10 @@
+# climate_prediction/main.py
 import os
 import logging
 import pandas as pd
 from datetime import datetime
 import json
-from src.data_processing.data_processing import DataProcessingPipeline  # Updated import
+from src.data_processing.data_processing import DataProcessingPipeline
 from src.models.model_trainer import ModelTrainer
 import warnings
 warnings.filterwarnings('ignore')

@@ -4,10 +4,10 @@ import dask.dataframe as dd
 from datetime import datetime
 import json
 from tqdm import tqdm
-from .preprocessor import DataPreprocessor
-from .feature_engineering import FeatureEngineer
-from .data_validator import DataValidator
-from .data_versioning import DataVersioning
+from src.data_processing.preprocessor import DataPreprocessor
+from src.data_processing.feature_engineering import FeatureEngineer
+from src.data_processing.data_validator import DataValidator
+from src.data_processing.data_versioning import DataVersioning
 import logging
 
 class DataProcessingPipeline:

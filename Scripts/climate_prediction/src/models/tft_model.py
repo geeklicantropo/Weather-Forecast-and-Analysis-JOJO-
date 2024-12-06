@@ -8,8 +8,8 @@ from pytorch_forecasting.metrics import QuantileLoss, RMSE, MAE, MAPE
 from pytorch_lightning import Trainer, callbacks
 from pytorch_lightning.callbacks import EarlyStopping, LearningRateMonitor
 import joblib
-from .base_model import BaseModel
-from ..utils.gpu_manager import gpu_manager
+from src.models.base_model import BaseModel
+from src.utils.gpu_manager import gpu_manager
 
 class CustomMetrics:
     def __init__(self):

@@ -10,9 +10,9 @@ import logging
 from tqdm import tqdm
 from typing import Dict, Tuple, Any, Optional
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-from .lstm_adapter import LSTMAdapter
-from .sarima_adapter import SARIMAAdapter
-from .tft_adapter import TFTAdapter
+from src.models.lstm_adapter import LSTMAdapter
+from src.models.sarima_adapter import SARIMAAdapter
+from src.models.tft_adapter import TFTAdapter
 
 class ModelTrainer:
     def __init__(self, config_path: str = 'config/model_config.yaml', target_variable: str = "TEMPERATURA DO AR - BULBO SECO HORARIA °C"):
