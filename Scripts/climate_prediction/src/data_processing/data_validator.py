@@ -327,6 +327,81 @@ class DataValidator:
         for column, stats in report.outliers.items():
             self.logger.info(f"  {column}: {stats['zscore_outliers']} z-score outliers")
 
+    def validate_data_quality(self, df: pd.DataFrame) -> Dict:
+        """Validate data quality and return comprehensive metrics."""
+        quality_metrics = {}
+        
+        # Basic completeness checks
+        completeness = {
+            col: 1 - df[col].isnull().mean() 
+            for col in df.columns
+        }
+        quality_metrics['completeness'] = completeness
+        
+        # Temporal continuity
+        if isinstance(df.index, pd.DatetimeIndex):
+            expected_intervals = pd.date_range(
+                start=df.index.min(),
+                end=df.index.max(),
+                freq='H'
+            )
+            temporal_completeness = len(df) / len(expected_intervals)
+            quality_metrics['temporal_completeness'] = temporal_completeness
+        
+        # Data consistency
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        consistency_metrics = {}
+        for col in numeric_cols:
+            stats = {
+                'mean': df[col].mean(),
+                'std': df[col].std(),
+                'skew': df[col].skew(),
+                'kurtosis': df[col].kurtosis(),
+                'outlier_ratio': (
+                    np.abs(stats.zscore(df[col].dropna())) > 3
+                ).mean()
+            }
+            consistency_metrics[col] = stats
+        quality_metrics['consistency'] = consistency_metrics
+        
+        # Value range validation
+        range_validations = {
+            'TEMPERATURA DO AR - BULBO SECO HORARIA °C': (-40, 50),
+            'UMIDADE RELATIVA DO AR HORARIA %': (0, 100),
+            'PRESSAO ATMOSFERICA AO NIVEL DA ESTACAO HORARIA MB': (800, 1100),
+            'PRECIPITACÃO TOTAL HORÁRIO MM': (0, 500)
+        }
+        
+        range_metrics = {}
+        for col, (min_val, max_val) in range_validations.items():
+            if col in df.columns:
+                valid_ratio = (
+                    (df[col] >= min_val) & 
+                    (df[col] <= max_val)
+                ).mean()
+                range_metrics[col] = valid_ratio
+        quality_metrics['value_ranges'] = range_metrics
+        
+        # Overall quality score
+        weights = {
+            'completeness': 0.3,
+            'temporal_completeness': 0.3,
+            'value_ranges': 0.4
+        }
+        
+        avg_completeness = np.mean(list(completeness.values()))
+        avg_range_validity = np.mean(list(range_metrics.values()))
+        
+        quality_score = (
+            weights['completeness'] * avg_completeness +
+            weights['temporal_completeness'] * temporal_completeness +
+            weights['value_ranges'] * avg_range_validity
+        )
+        
+        quality_metrics['overall_score'] = quality_score
+        
+        return quality_metrics
+
 if __name__ == "__main__":
     # Example usage
     config_manager = ConfigManager()

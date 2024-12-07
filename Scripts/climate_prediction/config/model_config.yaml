@@ -186,7 +186,7 @@ output:
       - interval_score
     
   visualization:
-    style: "seaborn-whitegrid"
+    style: "classic"
     context: "paper"
     dpi: 300
     formats: ["png", "html", "svg"]

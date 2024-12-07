@@ -22,5 +22,5 @@ models:
 
 visualization:
   dpi: 300
-  style: 'seaborn-whitegrid'
+  style: 'classic'
   format: ['png', 'html']

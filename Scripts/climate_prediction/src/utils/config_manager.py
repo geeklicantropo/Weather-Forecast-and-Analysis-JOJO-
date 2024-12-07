@@ -6,7 +6,7 @@ import logging
 from datetime import datetime
 
 class ConfigManager:
-    def __init__(self, config_path: str = "./config/model_config.yaml"):
+    def __init__(self, config_path: str = "Scripts/climate_prediction/config/model_config.yaml"):
         self.config_path = config_path
         self.config = self._load_config()
         self._validate_config()
@@ -104,17 +104,18 @@ class ConfigManager:
         if not all(0 <= x <= 1 for x in intervals):
             raise ValueError("Confidence intervals must be between 0 and 1")
 
+    
     def _setup_paths(self):
-        """Create necessary directories based on configuration."""
-        base_dir = self.config['output']['base_dir']
+        base_dir = os.path.join('Scripts', 'climate_prediction', self.config['output']['base_dir'])
         for subdir in self.config['output']['subdirs'].values():
             path = os.path.join(base_dir, subdir)
             os.makedirs(path, exist_ok=True)
-
+    
+    
     def _setup_logging(self):
-        """Configure logging based on configuration."""
         log_config = self.config['output']['logging']
         log_path = os.path.join(
+            'Scripts', 'climate_prediction',
             self.config['output']['base_dir'],
             self.config['output']['subdirs']['logs'],
             f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
@@ -144,8 +145,7 @@ class ConfigManager:
         self._validate_config()
 
     def save_config(self, path: Optional[str] = None):
-        """Save current configuration to file."""
-        save_path = path or self.config_path
+        save_path = path or os.path.join('Scripts', 'climate_prediction', self.config_path)
         with open(save_path, 'w') as f:
             yaml.dump(self.config, f, default_flow_style=False)
 

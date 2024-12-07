@@ -15,7 +15,7 @@ from src.models.sarima_adapter import SARIMAAdapter
 from src.models.tft_adapter import TFTAdapter
 
 class ModelTrainer:
-    def __init__(self, config_path: str = 'config/model_config.yaml', target_variable: str = "TEMPERATURA DO AR - BULBO SECO HORARIA °C"):
+    def __init__(self, config_path: str = 'Scripts/climate_prediction/config/model_config.yaml', target_variable: str = "TEMPERATURA DO AR - BULBO SECO HORARIA °C"):
         """
         Initialize ModelTrainer with configuration and setup.
         
@@ -32,7 +32,7 @@ class ModelTrainer:
         
     def setup_logging(self) -> None:
         """Setup logging configuration for model training."""
-        log_dir = 'outputs/logs'
+        log_dir = os.path.join('Scripts', 'climate_prediction', 'outputs', 'logs')
         os.makedirs(log_dir, exist_ok=True)
         
         log_path = f'{log_dir}/model_training_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'

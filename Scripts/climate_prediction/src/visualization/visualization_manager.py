@@ -11,8 +11,7 @@ import os
 from typing import Dict, List, Optional, Union
 
 class VisualizationManager:
-    def __init__(self, logger, style='seaborn-whitegrid', output_dir='outputs/plots'):
-        """Initialize visualization manager with style settings."""
+    def __init__(self, logger, style='classic', output_dir='Scripts/climate_prediction/outputs/plots'):
         self.logger = logger
         self.output_dir = output_dir
         plt.style.use(style)

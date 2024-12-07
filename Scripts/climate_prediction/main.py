@@ -46,14 +46,14 @@ class ClimateModelPipeline:
     def setup_directories(self):
         """Create all necessary directories."""
         directories = [
-            'outputs/data',
-            'outputs/models',
-            'outputs/plots',
-            'outputs/logs',
-            'outputs/predictions',
-            'outputs/metrics',
-            'outputs/metadata',
-            'config'
+            'Scripts/climate_prediction/outputs/data',
+            'Scripts/climate_prediction/outputs/models', 
+            'Scripts/climate_prediction/outputs/plots',
+            'Scripts/climate_prediction/outputs/logs',
+            'Scripts/climate_prediction/outputs/predictions',
+            'Scripts/climate_prediction/outputs/metrics',
+            'Scripts/climate_prediction/outputs/metadata',
+            'Scripts/climate_prediction/config'
         ]
         for directory in directories:
             os.makedirs(directory, exist_ok=True)

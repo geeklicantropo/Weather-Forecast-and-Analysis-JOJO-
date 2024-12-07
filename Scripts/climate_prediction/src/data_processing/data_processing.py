@@ -9,24 +9,27 @@ from src.data_processing.preprocessor import ClimateDataPreprocessor
 from src.data_processing.feature_engineering import FeatureEngineer
 from src.data_processing.data_validator import DataValidator
 from src.data_processing.data_versioning import DataVersioning
+from ..utils.config_manager import ConfigManager
 import logging
 
 class DataProcessingPipeline:
-    def __init__(self, data_path, target_variable="TEMPERATURA DO AR - BULBO SECO HORARIA °C"):
+    def __init__(self, data_path, target_variable="TEMPERATURA DO AR - BULBO SECO HORARIA °C", logger=None):
         self.data_path = data_path
         self.target_variable = target_variable
+        self.logger = logger or logging.getLogger(__name__)
         self._initialize_components()
         
     def _initialize_components(self):
         """Initialize pipeline components."""
         try:
-            self.preprocessor = ClimateDataPreprocessor(self.target_variable)
-            self.feature_engineer = FeatureEngineer(self.target_variable)
-            self.validator = DataValidator()
+            config_manager = ConfigManager() 
+            self.preprocessor = ClimateDataPreprocessor(self.target_variable, self.logger)
+            self.feature_engineer = FeatureEngineer(self.target_variable, self.logger)
+            self.validator = DataValidator(config_manager, self.logger) 
             self.versioning = DataVersioning()
-            logging.info("Pipeline components initialized successfully")
+            self.logger.info("Pipeline components initialized successfully")
         except Exception as e:
-            logging.error(f"Error initializing components: {str(e)}")
+            self.logger.error(f"Error initializing components: {str(e)}")
             raise
     
     def load_data(self):
@@ -56,7 +59,7 @@ class DataProcessingPipeline:
             # Validate initial data
             logging.info("Validating data schema...")
             with tqdm(total=1, desc="Validating Schema") as pbar:
-                self.validator.validate_schema(df)
+                self.validator._validate_schema(df)
                 pbar.update(1)
             
             # Preprocess data
@@ -64,7 +67,7 @@ class DataProcessingPipeline:
             with tqdm(total=2, desc="Preprocessing") as pbar:
                 df = self.preprocessor.preprocess(df)
                 pbar.update(1)
-                df = self.preprocessor.handle_missing_values(df)
+                df = self.preprocessor._handle_missing_values(df)
                 pbar.update(1)
             
             # Create features
@@ -89,7 +92,7 @@ class DataProcessingPipeline:
         """Save processed data and version information."""
         try:
             # Save processed data
-            output_path = 'outputs/data/processed_data.parquet'
+            output_path = os.path.join('Scripts', 'climate_prediction', 'outputs', 'data', 'processed_data.parquet')
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
             
             logging.info(f"Saving processed data to {output_path}")
@@ -121,13 +124,10 @@ class DataProcessingPipeline:
             logging.error(f"Error saving results: {str(e)}")
             raise
     
-    def run_pipeline(self):
+    def run_pipeline(self, df):
         """Execute the complete data processing pipeline."""
         try:
             logging.info("Starting data processing pipeline...")
-            
-            # Load data
-            df = self.load_data()
             
             # Process data
             df, quality_metrics = self.process_data(df)
