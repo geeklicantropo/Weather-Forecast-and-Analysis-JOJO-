@@ -43,15 +43,20 @@ class ProgressLogger:
     def log_info(self, message):
         """Log info message"""
         self.logger.info(message)
-        
+    
     def log_error(self, message):
         """Log error message"""
         self.logger.error(message)
-        
+    
     def log_warning(self, message):
         """Log warning message"""
         self.logger.warning(message)
         
+    # Alias methods to match standard logging interface
+    info = log_info
+    error = log_error
+    warning = log_warning
+    
     def get_progress_bar(self, total, desc="Processing", unit="items"):
         """Create a tqdm progress bar that also logs progress"""
         pbar = tqdm(total=total, desc=desc, unit=unit)

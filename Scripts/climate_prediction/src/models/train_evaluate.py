@@ -1,3 +1,4 @@
+# src/models/train_evaluate.py
 import os
 import sys
 from pathlib import Path
@@ -7,10 +8,6 @@ from datetime import datetime
 import logging
 from typing import Dict, List, Tuple
 
-# Add project root to path
-project_root = Path(__file__).parent.parent.parent.parent
-sys.path.append(str(project_root))
-
 from src.models.lstm_model import LSTMModel
 from src.models.sarima_model import SARIMAModel
 from src.models.tft_model import TFTModel
@@ -18,6 +15,7 @@ from src.models.model_evaluator import ModelEvaluator
 from src.utils.logger import ProgressLogger
 from src.utils.config_manager import ConfigManager
 from src.visualization.visualization_manager import VisualizationManager
+from src.utils.gpu_manager import gpu_manager
 
 class ModelTrainEvaluate:
     def __init__(self, config_path: str = "config/model_config.yaml"):
@@ -25,6 +23,7 @@ class ModelTrainEvaluate:
         self.config_manager = ConfigManager(config_path)
         self.config = self.config_manager.get_config()
         self.visualizer = VisualizationManager(self.logger)
+        self.device = gpu_manager.get_device()
         self._setup_directories()
         
     def _setup_directories(self):
@@ -42,7 +41,7 @@ class ModelTrainEvaluate:
         """Split data into train, validation, and test sets."""
         data = data.sort_index()
         
-        # Calculate split points
+        # Calculate split points based on config
         total_samples = len(data)
         train_size = int(total_samples * 0.7)
         val_size = int(total_samples * 0.15)
@@ -56,103 +55,144 @@ class ModelTrainEvaluate:
         return train_data, val_data, test_data
     
     def train_models(self, train_data: pd.DataFrame, val_data: pd.DataFrame) -> Dict:
-        """Train all models."""
+        """Train all models with GPU support and memory optimization."""
         models = {}
         training_histories = {}
         
-        # Initialize models
-        model_configs = {
-            'lstm': LSTMModel,
-            'sarima': SARIMAModel,
-            'tft': TFTModel
-        }
-        
-        for name, model_class in model_configs.items():
-            if self.config['models'][name].get('enabled', True):
-                self.logger.log_info(f"Training {name.upper()} model...")
-                try:
-                    model = model_class(
-                        target_variable=self.config['preprocessing']['target_variable'],
-                        logger=self.logger
-                    )
-                    history = model.train(train_data, val_data)
-                    models[name] = model
-                    training_histories[name] = history
+        try:
+            # Configure models based on available GPU memory
+            batch_size = gpu_manager.get_optimal_batch_size()
+            memory_info = gpu_manager.get_memory_info()
+            
+            model_configs = {
+                'lstm': (LSTMModel, {'batch_size': batch_size}),
+                'sarima': (SARIMAModel, {}),
+                'tft': (TFTModel, {'batch_size': batch_size})
+            }
+            
+            for name, (model_class, params) in model_configs.items():
+                if self.config['models'][name].get('enabled', True):
+                    self.logger.log_info(f"Training {name.upper()} model...")
                     
-                    # Save trained model
-                    model_path = f"outputs/models/{name}_model_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-                    model.save_model(model_path)
-                    
-                except Exception as e:
-                    self.logger.log_error(f"Error training {name} model: {str(e)}")
-                    continue
-        
-        return models, training_histories
+                    try:
+                        # Initialize model with GPU support
+                        model = model_class(
+                            target_variable=self.config['preprocessing']['target_variable'],
+                            logger=self.logger,
+                            **params
+                        )
+                        
+                        # Clear GPU memory before training
+                        if self.device.type == 'cuda':
+                            gpu_manager.clear_memory()
+                        
+                        # Train model
+                        with gpu_manager.memory_monitor():
+                            history = model.train(train_data, val_data)
+                            models[name] = model
+                            training_histories[name] = history
+                        
+                        # Save model checkpoint
+                        model_path = f"outputs/models/{name}_model_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                        model.save_model(model_path)
+                        
+                    except Exception as e:
+                        self.logger.log_error(f"Error training {name} model: {str(e)}")
+                        continue
+            
+            return models, training_histories
+            
+        except Exception as e:
+            self.logger.log_error(f"Model training failed: {str(e)}")
+            raise
     
     def evaluate_models(self, models: Dict, test_data: pd.DataFrame) -> Dict:
-        """Evaluate all trained models."""
+        """Evaluate all trained models with enhanced error handling."""
         evaluator = ModelEvaluator(self.logger)
         evaluation_results = {}
         
-        for name, model in models.items():
-            self.logger.log_info(f"Evaluating {name.upper()} model...")
-            try:
-                predictions = model.predict(test_data)
-                metrics = evaluator.evaluate_model(model, test_data, predictions)
-                evaluation_results[name] = {
-                    'metrics': metrics,
-                    'predictions': predictions
-                }
+        try:
+            for name, model in models.items():
+                self.logger.log_info(f"Evaluating {name.upper()} model...")
                 
-                # Generate and save evaluation plots
-                self.visualizer.plot_predictions(
-                    test_data[self.config['preprocessing']['target_variable']],
-                    {name: predictions}
+                try:
+                    # Generate predictions with GPU optimization
+                    with gpu_manager.memory_monitor():
+                        predictions = model.predict(test_data)
+                    
+                    # Calculate metrics
+                    metrics = evaluator.evaluate_model(model, test_data, predictions)
+                    evaluation_results[name] = {
+                        'metrics': metrics,
+                        'predictions': predictions
+                    }
+                    
+                    # Generate evaluation plots
+                    self.visualizer.plot_predictions(
+                        test_data[self.config['preprocessing']['target_variable']],
+                        {name: predictions}
+                    )
+                    
+                    # Save predictions
+                    predictions_path = f"outputs/predictions/{name}_predictions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                    predictions.to_csv(predictions_path)
+                    
+                except Exception as e:
+                    self.logger.log_error(f"Error evaluating {name} model: {str(e)}")
+                    continue
+            
+            # Generate comparison visualizations
+            if evaluation_results:
+                self.visualizer.plot_metrics_comparison(
+                    pd.DataFrame({name: results['metrics'] 
+                                for name, results in evaluation_results.items()})
                 )
-                self.visualizer.plot_residuals_analysis(
-                    {name: test_data[self.config['preprocessing']['target_variable']].values - predictions['forecast']}
-                )
-                
-            except Exception as e:
-                self.logger.log_error(f"Error evaluating {name} model: {str(e)}")
-                continue
-        
-        # Save evaluation results
-        results_path = f"outputs/metrics/evaluation_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        pd.DataFrame(evaluation_results).to_json(results_path)
-        
-        return evaluation_results
+            
+            return evaluation_results
+            
+        except Exception as e:
+            self.logger.log_error(f"Model evaluation failed: {str(e)}")
+            raise
     
-    def generate_future_predictions(self, models: Dict, data: pd.DataFrame, years: int = 10) -> Dict:
-        """Generate future predictions for all models."""
-        prediction_horizon = years * 365 * 24  # Convert years to hours
+    def generate_future_predictions(self, models: Dict, data: pd.DataFrame, horizon: int = None) -> Dict:
+        """Generate future predictions with uncertainty estimation."""
+        horizon = horizon or int(self.config['output']['forecast']['horizon'])
         future_predictions = {}
         
-        for name, model in models.items():
-            self.logger.log_info(f"Generating predictions for {name.upper()}...")
-            try:
-                predictions = model.predict(data, prediction_horizon)
-                future_predictions[name] = predictions
+        try:
+            for name, model in models.items():
+                self.logger.log_info(f"Generating predictions for {name.upper()}...")
                 
-                # Save predictions
-                predictions_path = f"outputs/predictions/{name}_predictions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-                predictions.to_csv(predictions_path)
-                
-                # Generate forecast plots
+                try:
+                    # Generate predictions with GPU optimization
+                    with gpu_manager.memory_monitor():
+                        predictions = model.predict(data, horizon)
+                        future_predictions[name] = predictions
+                    
+                    # Save predictions
+                    predictions_path = f"outputs/predictions/{name}_future_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                    predictions.to_csv(predictions_path)
+                    
+                except Exception as e:
+                    self.logger.log_error(f"Error generating predictions for {name}: {str(e)}")
+                    continue
+            
+            # Generate forecast visualizations
+            if future_predictions:
                 self.visualizer.plot_forecast_horizon(
                     data[self.config['preprocessing']['target_variable']],
-                    {name: predictions},
+                    future_predictions,
                     forecast_start=data.index[-1]
                 )
-                
-            except Exception as e:
-                self.logger.log_error(f"Error generating predictions for {name}: {str(e)}")
-                continue
-        
-        return future_predictions
+            
+            return future_predictions
+            
+        except Exception as e:
+            self.logger.log_error(f"Future prediction generation failed: {str(e)}")
+            raise
     
     def run_pipeline(self, data: pd.DataFrame) -> Dict:
-        """Execute the complete training and evaluation pipeline."""
+        """Execute complete training and evaluation pipeline."""
         try:
             # Prepare data
             train_data, val_data, test_data = self.prepare_data(data)
@@ -165,12 +205,6 @@ class ModelTrainEvaluate:
             
             # Generate future predictions
             future_predictions = self.generate_future_predictions(models, data)
-            
-            # Generate comparison visualizations
-            self.visualizer.plot_metrics_comparison(
-                pd.DataFrame({name: results['metrics'] 
-                            for name, results in evaluation_results.items()})
-            )
             
             return {
                 'models': models,
@@ -189,7 +223,7 @@ if __name__ == "__main__":
     pipeline = ModelTrainEvaluate(config_path)
     
     # Load your data
-    data = pd.read_parquet("outputs/data/processed_data.parquet")
+    data = pd.read_csv("outputs/data/processed_data.csv.gz")
     
     # Run pipeline
     results = pipeline.run_pipeline(data)

@@ -1,7 +1,8 @@
-#src/utils/gpu_manager.pyimport torch
+import torch
 import os
 from typing import Optional
 import torch
+from contextlib import contextmanager
 
 class GPUManager:
     def __init__(self):
@@ -37,5 +38,31 @@ class GPUManager:
         elif total_memory >= 8:
             return base_batch_size * 2
         return base_batch_size
+    
+    @contextmanager
+    def memory_monitor(self):
+        """Context manager to monitor GPU memory usage."""
+        if not self.gpu_available:
+            yield
+            return
+        
+        try:
+            start_memory = self.get_memory_info()
+            yield
+            end_memory = self.get_memory_info()
+            
+            memory_diff = {
+                key: end_memory[key] - start_memory[key]
+                for key in start_memory
+            }
+            
+            print(f"GPU Memory Usage:")
+            print(f"  Allocated: {memory_diff['allocated']:.2f} MB")
+            print(f"  Cached: {memory_diff['cached']:.2f} MB")
+            print(f"  Free: {memory_diff['free']:.2f} MB")
+            
+        except Exception as e:
+            print(f"Error monitoring GPU memory: {str(e)}")
+            raise
 
 gpu_manager = GPUManager()  # Singleton instance

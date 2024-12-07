@@ -26,9 +26,11 @@ class SARIMAModel(BaseModel):
         self.best_params = None
         self.decomposition = None
         
-    def preprocess_data(self, df):
+    def preprocess_data(self, df: pd.DataFrame):
+        """Prepare data for SARIMA model."""
         try:
             df = df.copy()
+            # Convert index to datetime if not already
             df.index = pd.to_datetime(df.index)
             
             # Ensure hourly frequency and handle missing values
@@ -39,17 +41,19 @@ class SARIMAModel(BaseModel):
             # Remove remaining NaN if any
             df = df.dropna()
             
-            # Perform seasonal decomposition
+            # Get target variable series
+            target_series = df[self.target_variable]
+            
+            # Store seasonal decomposition
             self.decomposition = seasonal_decompose(
-                df[self.target_variable], 
+                target_series,
                 period=24,  # 24 hours seasonality
                 extrapolate_trend='freq'
             )
             
-            return df[self.target_variable]
-            
+            return target_series
         except Exception as e:
-            self.logger.log_error(f"Preprocessing error: {str(e)}")
+            self.logger.error(f"Error in SARIMA preprocessing: {str(e)}")
             raise
             
     def _evaluate_sarima_params(self, params, train_data, val_data):

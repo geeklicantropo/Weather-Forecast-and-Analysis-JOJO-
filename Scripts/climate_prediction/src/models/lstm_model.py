@@ -34,27 +34,33 @@ class LSTMModel(BaseModel):
         self.device = gpu_manager.get_device()
         self.batch_size = gpu_manager.get_optimal_batch_size()
         
-    def preprocess_data(self, df):
-        features = df.select_dtypes(include=[np.number]).copy()
-        self.feature_names = features.columns.tolist()
-        
-        # Scale features
-        scaled_data = self.scaler.fit_transform(features)
-        sequences = []
-        targets = []
-        
-        # Multi-step sequence creation
-        for i in range(len(scaled_data) - self.sequence_length - self.forecast_horizon + 1):
-            sequences.append(scaled_data[i:(i + self.sequence_length)])
-            targets.append(scaled_data[
-                (i + self.sequence_length):(i + self.sequence_length + self.forecast_horizon),
-                features.columns.get_loc(self.target_variable)
-            ])
-        
-        X = torch.FloatTensor(np.array(sequences)).to(self.device)
-        y = torch.FloatTensor(np.array(targets)).to(self.device)
-        
-        return TensorDataset(X, y)
+    def preprocess_data(self, df: pd.DataFrame):
+        """Prepare data for LSTM model."""
+        try:
+            df = df.copy()
+            # Create sequence data with rolling windows
+            features = df.select_dtypes(include=[np.number]).copy()
+            self.feature_names = features.columns.tolist()
+            
+            # Scale features
+            scaled_data = self.scaler.fit_transform(features)
+            sequences = []
+            targets = []
+            
+            for i in range(len(scaled_data) - self.sequence_length - self.forecast_horizon + 1):
+                sequences.append(scaled_data[i:(i + self.sequence_length)])
+                targets.append(scaled_data[
+                    (i + self.sequence_length):(i + self.sequence_length + self.forecast_horizon),
+                    features.columns.get_loc(self.target_variable)
+                ])
+            
+            X = torch.FloatTensor(np.array(sequences)).to(self.device)
+            y = torch.FloatTensor(np.array(targets)).to(self.device)
+            
+            return TensorDataset(X, y)
+        except Exception as e:
+            self.logger.error(f"Error in LSTM preprocessing: {str(e)}")
+            raise
     
     def train(self, train_data, validation_data=None, epochs=50):
         input_size = len(self.feature_names)

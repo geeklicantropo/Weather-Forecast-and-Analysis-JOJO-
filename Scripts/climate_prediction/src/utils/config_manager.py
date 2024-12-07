@@ -16,13 +16,13 @@ class ConfigManager:
     def _load_config(self) -> Dict[str, Any]:
         """Load and merge configuration files."""
         try:
-            with open(self.config_path, 'r') as f:
+            with open(self.config_path, 'r', encoding='utf-8') as f:
                 config = yaml.safe_load(f)
             
             # Load environment-specific overrides if they exist
             env_config_path = os.getenv('MODEL_CONFIG_PATH')
             if env_config_path and os.path.exists(env_config_path):
-                with open(env_config_path, 'r') as f:
+                with open(env_config_path, 'r', encoding='utf-8') as f:
                     env_config = yaml.safe_load(f)
                 config = self._deep_update(config, env_config)
                 

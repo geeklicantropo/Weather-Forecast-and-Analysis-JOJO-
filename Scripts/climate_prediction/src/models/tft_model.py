@@ -7,6 +7,7 @@ from pytorch_forecasting.data import GroupNormalizer, NaNLabelEncoder
 from pytorch_forecasting.metrics import QuantileLoss, RMSE, MAE, MAPE
 from pytorch_lightning import Trainer, callbacks
 from pytorch_lightning.callbacks import EarlyStopping, LearningRateMonitor
+from pytorch_forecasting import TimeSeriesDataSet, GroupNormalizer
 import joblib
 from src.models.base_model import BaseModel
 from src.utils.gpu_manager import gpu_manager
@@ -60,56 +61,54 @@ class TFTModel(BaseModel):
         
         return df
         
-    def preprocess_data(self, df):
+    def preprocess_data(self, df: pd.DataFrame) -> TimeSeriesDataSet:
+        """Prepare data for TFT model."""
         try:
-            df = self._create_features(df)
+            df = df.copy()
             
-            # Select features
-            static_categoricals = ['ESTACAO', 'UF']
-            static_reals = ['LATITUDE', 'LONGITUDE', 'ALTITUDE']
-            time_varying_known_categoricals = [
-                'hour', 'day', 'month', 'day_of_week', 'is_weekend'
-            ]
-            time_varying_known_reals = [
-                'time_idx', 'hour_of_week', 'week_of_year'
-            ]
-            time_varying_unknown_reals = [
-                self.target_variable,
-                'PRECIPITACÃO TOTAL HORÁRIO MM',
-                'PRESSAO ATMOSFERICA AO NIVEL DA ESTACAO HORARIA MB',
-                'UMIDADE RELATIVA DO AR HORARIA %',
-                'VENTO VELOCIDADE HORARIA M/S'
-            ]
+            # Create time index
+            df['time_idx'] = (pd.to_datetime(df.index) - pd.to_datetime(df.index).min()).total_seconds() / 3600
             
-            self.training = TimeSeriesDataSet(
+            # Add temporal features
+            df['hour'] = pd.to_datetime(df.index).hour
+            df['day'] = pd.to_datetime(df.index).day
+            df['month'] = pd.to_datetime(df.index).month
+            df['day_of_week'] = pd.to_datetime(df.index).dayofweek
+            df['week'] = pd.to_datetime(df.index).isocalendar().week
+            df['is_weekend'] = df['day_of_week'].isin([5, 6]).astype(int)
+            df['hour_of_week'] = df['hour'] + df['day_of_week'] * 24
+            
+            # Create TimeSeriesDataSet
+            training = TimeSeriesDataSet(
                 df,
                 time_idx="time_idx",
                 target=self.target_variable,
-                group_ids=static_categoricals,
+                group_ids=["ESTACAO"],
                 min_encoder_length=self.max_encoder_length // 2,
                 max_encoder_length=self.max_encoder_length,
                 min_prediction_length=1,
-                max_prediction_length=self.max_prediction_length,
-                static_categoricals=static_categoricals,
-                static_reals=static_reals,
-                time_varying_known_categoricals=time_varying_known_categoricals,
-                time_varying_known_reals=time_varying_known_reals,
-                time_varying_unknown_reals=time_varying_unknown_reals,
+                max_prediction_length=self.forecast_horizon,
+                static_categoricals=["ESTACAO", "UF"],
+                static_reals=["LATITUDE", "LONGITUDE", "ALTITUDE"],
+                time_varying_known_categoricals=["hour", "day", "month", "day_of_week", "is_weekend"],
+                time_varying_known_reals=["time_idx", "hour_of_week", "week"],
+                time_varying_unknown_reals=[
+                    self.target_variable,
+                    "PRECIPITACÃO TOTAL HORÁRIO MM",
+                    "PRESSAO ATMOSFERICA AO NIVEL DA ESTACAO HORARIA MB",
+                    "UMIDADE RELATIVA DO AR HORARIA %",
+                    "VENTO VELOCIDADE HORARIA M/S"
+                ],
                 target_normalizer=GroupNormalizer(
-                    groups=static_categoricals,
-                    transformation="softplus",
-                    center=True
-                ),
-                add_relative_time_idx=True,
-                add_target_scales=True,
-                add_encoder_length=True,
-                allow_missing_timesteps=True
+                    groups=["ESTACAO"],
+                    transformation="softplus"
+                )
             )
             
-            return self.training
+            return training
             
         except Exception as e:
-            self.logger.log_error(f"Preprocessing error: {str(e)}")
+            self.logger.error(f"Error in TFT preprocessing: {str(e)}")
             raise
             
     def _create_dataloaders(self, training, validation=None):

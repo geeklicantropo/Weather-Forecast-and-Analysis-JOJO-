@@ -13,4 +13,11 @@ In the root folder ( where this README is located), run the following files in o
 * python3 Scripts/data_concatenation.py (and wait for it to finish)
 
 # How to make predictions?
-Run the command python3 Scripts/climate_prediction/main.py
+1. First run data splitting:
+* Run the command python3 Scripts/climate_prediction/src/data_processing/split_data.py
+
+2. Then run data processing:
+* Run the command python3 Scripts/climate_prediction/process_data.py
+
+3. Only then, run the predictions:
+* Run the command python3 Scripts/climate_prediction/main.py

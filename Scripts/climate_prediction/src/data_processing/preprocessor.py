@@ -1,15 +1,14 @@
-import numpy as np
 import pandas as pd
-import dask.dataframe as dd
-import cudf
-import dask_cudf
+import numpy as np
 from scipy import stats
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, List
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
+import gc
+import psutil
+import tqdm
 
 class ClimateDataPreprocessor:
-    # Physical constraints for meteorological variables
     VALID_RANGES = {
         'TEMPERATURA DO AR - BULBO SECO HORARIA °C': (-40, 50),
         'PRECIPITACÃO TOTAL HORÁRIO MM': (0, 500),
@@ -24,194 +23,189 @@ class ClimateDataPreprocessor:
     def __init__(self, target_variable: str, logger):
         self.target_variable = target_variable
         self.logger = logger
-        self.essential_columns = [
-            'DATETIME',
-            self.target_variable,
-            'PRECIPITACÃO TOTAL HORÁRIO MM',
-            'PRESSAO ATMOSFERICA AO NIVEL DA ESTACAO HORARIA MB',
-            'RADIACAO GLOBAL KJ/M²',
-            'UMIDADE RELATIVA DO AR HORARIA %',
-            'VENTO VELOCIDADE HORARIA M/S',
-            'LATITUDE',
-            'LONGITUDE',
-            'ALTITUDE'
-        ]
-
-    def preprocess(self, df: pd.DataFrame, use_gpu: bool = False) -> pd.DataFrame:
-        """Main preprocessing pipeline for climate data."""
+        self.chunk_size = self._calculate_optimal_chunk_size()
+        
+    def _calculate_optimal_chunk_size(self) -> int:
+        """Calculate optimal chunk size based on available memory."""
+        available_memory = psutil.virtual_memory().available
+        target_memory_per_chunk = available_memory * 0.1  # Use 10% of available memory
+        estimated_row_size = 1024  # bytes per row
+        return max(10000, min(int(target_memory_per_chunk / estimated_row_size), 50000))
+        
+    def preprocess(self, input_path: str, output_path: str) -> None:
+        """Process data in chunks with memory management."""
         try:
-            self.logger.info("Starting climate data preprocessing")
+            # Count total rows for progress tracking
+            total_rows = sum(1 for _ in pd.read_csv(input_path, chunksize=self.chunk_size))
             
-            # Replace invalid values
-            df = self._handle_invalid_values(df)
-            
-            # Validate meteorological constraints
-            df = self._validate_meteorological_data(df)
-            
-            # Handle missing values with climate-specific logic
-            df = self._handle_missing_values(df)
-            
-            # Remove statistical outliers while preserving extreme weather events
-            df = self._handle_climate_outliers(df)
-            
-            # Quality control checks
-            df = self._apply_quality_control(df)
-            
-            # Select and order essential columns
-            df = df[self.essential_columns].copy()
-            
-            # Set datetime index
-            if 'DATETIME' in df.columns:
-                df = df.set_index('DATETIME').sort_index()
-            
-            self.logger.info("Preprocessing completed successfully")
-            return df
-            
+            with tqdm(total=total_rows, desc="Preprocessing data") as pbar:
+                for i, chunk in enumerate(pd.read_csv(input_path, chunksize=self.chunk_size)):
+                    try:
+                        processed_chunk = self._process_chunk(chunk)
+                        
+                        # Save processed chunk
+                        mode = 'w' if i == 0 else 'a'
+                        header = i == 0
+                        processed_chunk.to_csv(output_path, 
+                                            compression='gzip',
+                                            mode=mode,
+                                            header=header,
+                                            index=True)
+                        
+                        pbar.update(len(chunk))
+                        self._cleanup_memory()
+                        
+                    except Exception as e:
+                        self.logger.error(f"Error processing chunk {i}: {str(e)}")
+                        continue
+                        
         except Exception as e:
             self.logger.error(f"Preprocessing failed: {str(e)}")
             raise
-
+            
+    def _process_chunk(self, chunk: pd.DataFrame) -> pd.DataFrame:
+        """Process a single data chunk."""
+        chunk = chunk.copy()
+        
+        # Sequential processing steps
+        chunk = self._handle_invalid_values(chunk)
+        chunk = self._validate_meteorological_data(chunk)
+        chunk = self._handle_missing_values(chunk)
+        chunk = self._handle_climate_outliers(chunk)
+        chunk = self._apply_quality_control(chunk)
+        
+        return chunk
+        
     def _handle_invalid_values(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Replace known invalid values with NaN."""
-        for val in self.INVALID_VALUES:
-            for col in df.select_dtypes(include=[np.number]).columns:
-                df[col] = df[col].replace(val, np.nan)
+        """Replace invalid values with NaN."""
+        for col in df.select_dtypes(include=[np.number]).columns:
+            df[col] = df[col].replace(self.INVALID_VALUES, np.nan)
         return df
-
+        
     def _validate_meteorological_data(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Validate data based on physical constraints."""
+        """Validate values are within expected ranges."""
         for column, (min_val, max_val) in self.VALID_RANGES.items():
             if column in df.columns:
-                invalid_mask = (df[column] < min_val) | (df[column] > max_val)
-                if invalid_mask.any():
-                    self.logger.warning(
-                        f"Found {invalid_mask.sum()} invalid values in {column}"
-                    )
-                    df.loc[invalid_mask, column] = np.nan
+                mask = (df[column] < min_val) | (df[column] > max_val)
+                df.loc[mask, column] = np.nan
         return df
-
+        
     def _handle_missing_values(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Handle missing values using climate-specific strategies."""
-        # Short gaps (≤ 6 hours): Forward fill
+        """Handle missing values using multiple methods."""
+        # Forward fill short gaps
         df = df.fillna(method='ffill', limit=6)
         
-        # Medium gaps (≤ 24 hours): Interpolate with time and seasonal patterns
-        for col in df.columns:
-            if col in self.VALID_RANGES:
-                # Use time-based interpolation for medium gaps
-                df[col] = df[col].interpolate(
-                    method='time',
-                    limit=24,
-                    limit_direction='both'
-                )
-        
-        # Long gaps (> 24 hours): Use seasonal patterns
-        df = self._fill_long_gaps(df)
+        # Interpolate medium gaps using relevant variables
+        for col in self.VALID_RANGES.keys():
+            if col in df.columns:
+                # Get correlated columns for multivariate interpolation
+                corr_cols = self._get_correlated_columns(df, col)
+                df[col] = self._interpolate_with_correlations(df, col, corr_cols)
         
         return df
-
-    def _fill_long_gaps(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Fill long gaps using seasonal patterns."""
-        for col in df.columns:
-            if col in self.VALID_RANGES:
-                # Calculate seasonal patterns
-                hourly_mean = df.groupby(df.index.hour)[col].mean()
-                daily_mean = df.groupby(df.index.dayofyear)[col].mean()
-                
-                # Fill remaining gaps using seasonal patterns
-                missing_mask = df[col].isna()
-                if missing_mask.any():
-                    df.loc[missing_mask, col] = df.index[missing_mask].map(
-                        lambda x: hourly_mean[x.hour] * 
-                        (daily_mean[x.dayofyear] / daily_mean.mean())
-                    )
         
-        return df
-
+    def _get_correlated_columns(self, df: pd.DataFrame, target_col: str) -> List[str]:
+        """Find columns correlated with target for interpolation."""
+        correlations = df.corr()[target_col].abs()
+        return correlations[correlations > 0.5].index.tolist()
+        
+    def _interpolate_with_correlations(self, df: pd.DataFrame, target_col: str, 
+                                     corr_cols: List[str]) -> pd.Series:
+        """Interpolate using correlated variables when available."""
+        # Simple interpolation if no correlations
+        if len(corr_cols) <= 1:
+            return df[target_col].interpolate(method='linear', limit=24)
+            
+        # Multiple variable interpolation
+        not_all_null = df[corr_cols].notna().any(axis=1)
+        df.loc[not_all_null, target_col] = df.loc[not_all_null, target_col].interpolate()
+        return df[target_col]
+        
     def _handle_climate_outliers(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Handle outliers while preserving extreme weather events."""
-        for col in df.columns:
-            if col in self.VALID_RANGES:
+        """Detect and handle climate outliers considering physical relationships."""
+        for col in self.VALID_RANGES.keys():
+            if col in df.columns:
                 # Calculate rolling statistics
-                rolling_mean = df[col].rolling(window=24*7).mean()
-                rolling_std = df[col].rolling(window=24*7).std()
+                window = min(24, len(df))  # 24 hours or chunk length
+                rolling_stats = df[col].rolling(window=window, center=True)
                 
-                # Define dynamic thresholds
-                threshold = 4  # More permissive than standard 3-sigma
-                lower_bound = rolling_mean - threshold * rolling_std
-                upper_bound = rolling_mean + threshold * rolling_std
+                median = rolling_stats.median()
+                std = rolling_stats.std()
                 
-                # Identify statistical outliers
+                # Define outlier bounds
+                lower_bound = median - 3 * std
+                upper_bound = median + 3 * std
+                
+                # Check if extreme values are physically consistent
                 outliers = (df[col] < lower_bound) | (df[col] > upper_bound)
-                
-                # Verify if outliers are part of a weather pattern
                 if outliers.any():
-                    weather_pattern = self._verify_weather_pattern(df, col, outliers)
-                    # Only remove outliers not part of weather patterns
-                    df.loc[outliers & ~weather_pattern, col] = np.nan
-        
+                    valid_extremes = self._verify_weather_pattern(df, col, outliers)
+                    df.loc[outliers & ~valid_extremes, col] = np.nan
+                    
         return df
-
+        
     def _verify_weather_pattern(self, df: pd.DataFrame, column: str, 
                               outlier_mask: pd.Series) -> pd.Series:
-        """Verify if outliers are part of legitimate weather patterns."""
-        weather_pattern = pd.Series(False, index=df.index)
+        """Verify if extreme values are supported by weather patterns."""
+        valid_pattern = pd.Series(False, index=df.index)
         
-        # Check for sustained patterns (3 or more consecutive values)
-        rolling_outliers = outlier_mask.rolling(window=3).sum()
-        weather_pattern |= (rolling_outliers >= 3)
-        
-        # Check for correlated changes in related variables
         if column == 'TEMPERATURA DO AR - BULBO SECO HORARIA °C':
-            # Temperature drops often correlate with precipitation
+            # Validate temperature drops with precipitation
             temp_drops = df[column].diff() < -5
             rain_events = df['PRECIPITACÃO TOTAL HORÁRIO MM'] > 0
-            weather_pattern |= (temp_drops & rain_events)
+            valid_pattern |= (temp_drops & rain_events)
             
         elif column == 'PRESSAO ATMOSFERICA AO NIVEL DA ESTACAO HORARIA MB':
-            # Pressure changes often precede temperature changes
-            pressure_changes = abs(df[column].diff()) > 10
-            temp_changes = abs(df['TEMPERATURA DO AR - BULBO SECO HORARIA °C'].diff()) > 5
-            weather_pattern |= (pressure_changes & temp_changes.shift(-6))
+            # Validate pressure changes with temperature changes
+            pressure_changes = df[column].diff().abs() > 10
+            temp_changes = df['TEMPERATURA DO AR - BULBO SECO HORARIA °C'].diff().abs() > 5
+            valid_pattern |= (pressure_changes & temp_changes.shift(-6))
+            
+        return valid_pattern
         
-        return weather_pattern
-
     def _apply_quality_control(self, df: pd.DataFrame) -> pd.DataFrame:
         """Apply final quality control checks."""
-        # Check for physically impossible rates of change
         max_hourly_changes = {
-            'TEMPERATURA DO AR - BULBO SECO HORARIA °C': 10,  # °C per hour
-            'PRESSAO ATMOSFERICA AO NIVEL DA ESTACAO HORARIA MB': 20,  # mb per hour
-            'UMIDADE RELATIVA DO AR HORARIA %': 50  # % per hour
+            'TEMPERATURA DO AR - BULBO SECO HORARIA °C': 10,
+            'PRESSAO ATMOSFERICA AO NIVEL DA ESTACAO HORARIA MB': 20,
+            'UMIDADE RELATIVA DO AR HORARIA %': 50
         }
         
         for col, max_change in max_hourly_changes.items():
             if col in df.columns:
                 changes = df[col].diff().abs()
-                invalid_changes = changes > max_change
-                if invalid_changes.any():
-                    self.logger.warning(
-                        f"Found {invalid_changes.sum()} suspicious rate changes in {col}"
-                    )
-                    df.loc[invalid_changes, col] = np.nan
-        
-        # Ensure temporal consistency
-        if isinstance(df.index, pd.DatetimeIndex):
-            time_gaps = df.index.to_series().diff() > pd.Timedelta(hours=1)
-            if time_gaps.any():
-                self.logger.warning(
-                    f"Found {time_gaps.sum()} time gaps larger than 1 hour"
-                )
-        
+                invalid_mask = changes > max_change
+                df.loc[invalid_mask, col] = np.nan
+                
         return df
+        
+    def _cleanup_memory(self):
+        """Clean up memory after chunk processing."""
+        gc.collect()
+        memory_usage = psutil.Process().memory_info().rss / 1024 / 1024  # MB
+        if memory_usage > 1024:  # If usage exceeds 1GB
+            self.logger.warning(f"High memory usage: {memory_usage:.2f} MB")
 
-    def get_statistics(self, df: pd.DataFrame) -> Dict:
-        """Calculate preprocessing statistics."""
-        return {
-            'missing_values': df.isnull().sum().to_dict(),
-            'data_ranges': {
-                col: {'min': df[col].min(), 'max': df[col].max()}
-                for col in df.columns if col in self.VALID_RANGES
-            },
-            'completeness': (1 - df.isnull().mean()).to_dict()
-        }
+if __name__ == "__main__":
+    # Setup logging
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    
+    # Initialize preprocessor
+    preprocessor = ClimateDataPreprocessor(
+        target_variable="TEMPERATURA DO AR - BULBO SECO HORARIA °C",
+        logger=logger
+    )
+    
+    # Process train and test files
+    input_files = [
+        "Scripts/climate_prediction/outputs/data/train_processed.csv.gz",
+        "Scripts/climate_prediction/outputs/data/test_processed.csv.gz"
+    ]
+    output_files = [
+        "Scripts/climate_prediction/outputs/data/train_preprocessed.csv.gz",
+        "Scripts/climate_prediction/outputs/data/test_preprocessed.csv.gz"
+    ]
+    
+    for input_path, output_path in zip(input_files, output_files):
+        preprocessor.preprocess(input_path, output_path)
