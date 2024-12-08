@@ -19,5 +19,8 @@ In the root folder ( where this README is located), run the following files in o
 2. Then run data processing:
 * Run the command python3 Scripts/climate_prediction/process_data.py
 
-3. Only then, run the predictions:
+3. Set up the configurations:
+Run the comamnd python3 Scripts/climate_prediction/setup_config.py
+
+4. Only then, run the predictions:
 * Run the command python3 Scripts/climate_prediction/main.py

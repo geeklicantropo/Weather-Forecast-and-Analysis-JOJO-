@@ -1,225 +1,233 @@
-# General training configuration
-training:
-  batch_size: 64
-  learning_rate: 0.001
-  epochs: 100
-  early_stopping_patience: 10
-  validation_split: 0.2
-  cross_validation:
-    n_splits: 5
-    shuffle: false
-  optimizer:
-    type: "adam"
-    parameters:
-      beta1: 0.9
-      beta2: 0.999
-      epsilon: 1e-8
-      weight_decay: 0.0001
-  scheduler:
-    type: "reduce_on_plateau"
-    parameters:
-      mode: "min"
-      factor: 0.5
-      patience: 5
-      min_lr: 1e-6
-
-# Feature engineering configuration
 feature_engineering:
-  temporal_features:
-    cyclical:
-      - hour
-      - day
-      - month
-      - day_of_week
-    categorical:
-      - season
-      - is_weekend
-      - is_holiday
-    numerical:
-      - day_of_year
-      - week_of_year
-  
-  rolling_windows:
-    short_term: [24, 48, 72]        # 1-3 days
-    medium_term: [168, 336, 504]    # 1-3 weeks
-    long_term: [720, 2160, 4320]    # 1-6 months
-  
   aggregations:
     functions:
-      - mean
-      - std
-      - min
-      - max
-      - range
-      - skew
-      - kurt
-    
+    - mean
+    - std
+    - min
+    - max
+    - range
+    - skew
+    - kurt
   interaction_features:
-    - ["TEMPERATURA DO AR - BULBO SECO HORARIA °C", "UMIDADE RELATIVA DO AR HORARIA %"]
-    - ["PRESSAO ATMOSFERICA AO NIVEL DA ESTACAO HORARIA MB", "TEMPERATURA DO AR - BULBO SECO HORARIA °C"]
-    
+  - - "TEMPERATURA DO AR - BULBO SECO HORARIA \xB0C"
+    - UMIDADE RELATIVA DO AR HORARIA %
+  - - PRESSAO ATMOSFERICA AO NIVEL DA ESTACAO HORARIA MB
+    - "TEMPERATURA DO AR - BULBO SECO HORARIA \xB0C"
+  rolling_windows:
+    long_term:
+    - 720
+    - 2160
+    - 4320
+    medium_term:
+    - 168
+    - 336
+    - 504
+    short_term:
+    - 24
+    - 48
+    - 72
   seasonal_decomposition:
+    extrapolate_trend: freq
+    model: additive
     period: 24
-    model: "additive"
-    extrapolate_trend: 'freq'
-
-# Preprocessing configuration
-preprocessing:
-  target_variable: "TEMPERATURA DO AR - BULBO SECO HORARIA °C"
-  datetime_format: "%Y-%m-%d %H:%M:%S"
-  invalid_values: [-9999.0, -999.0, -99.0, 9999.0]
-  
-  missing_values:
-    strategy:
-      short_gaps: "forward_fill"  # gaps <= 6 hours
-      medium_gaps: "interpolate"  # gaps <= 24 hours
-      long_gaps: "seasonal_interpolate"  # gaps > 24 hours
-    interpolation_methods:
-      numeric: "cubic"
-      categorical: "mode"
-    interpolation_limit: 24  # hours
-  
-  outlier_detection:
-    method: "zscore"
-    threshold: 3.0
-    rolling_window: 720  # 30 days
-  
-  scaling:
-    method: "robust"
-    parameters:
-      quantile_range: [0.01, 0.99]
-
-# GPU configuration
+  temporal_features:
+    categorical:
+    - season
+    - is_weekend
+    - is_holiday
+    cyclical:
+    - hour
+    - day
+    - month
+    - day_of_week
+    numerical:
+    - day_of_year
+    - week_of_year
 gpu:
-  memory_fraction: 0.8
-  precision: "float32"
-  batch_growth_rate: 1.5
-  memory_growth: true
   allow_memory_growth: true
-  per_process_gpu_memory_fraction: 0.9
+  batch_growth_rate: 1.5
+  memory_fraction: 0.8
+  memory_growth: true
   optimization:
     mixed_precision: true
-    xla: true
     tensor_cores: true
-
-# Model-specific configurations
+    xla: true
+  per_process_gpu_memory_fraction: 0.9
+  precision: float32
 models:
   lstm:
     architecture:
-      input_size: null  # Set dynamically
-      hidden_size: 128
-      num_layers: 2
-      dropout: 0.1
       bidirectional: true
+      dropout: 0.1
+      hidden_size: 128
+      input_size: null
+      num_layers: 2
+    enabled: true
     training:
-      sequence_length: 168  # 1 week
-      stride: 24
       batch_norm: true
-      layer_norm: true
       gradient_clip: 1.0
-    
+      layer_norm: true
+      sequence_length: 168
+      stride: 24
   sarima:
-    order:
-      p: [0, 1, 2]
-      d: [0, 1]
-      q: [0, 1, 2]
-    seasonal_order:
-      P: [0, 1]
-      D: [0, 1]
-      Q: [0, 1]
-      s: [24, 168, 720]  # daily, weekly, monthly
+    enabled: true
     fitting:
-      method: "lbfgs"
-      maxiter: 50
-      optim_score: "aic"
-      enforce_stationarity: true
       enforce_invertibility: true
-    
+      enforce_stationarity: true
+      maxiter: 50
+      method: lbfgs
+      optim_score: aic
+    order:
+      d:
+      - 0
+      - 1
+      p:
+      - 0
+      - 1
+      - 2
+      q:
+      - 0
+      - 1
+      - 2
+    seasonal_order:
+      D:
+      - 0
+      - 1
+      P:
+      - 0
+      - 1
+      Q:
+      - 0
+      - 1
+      s:
+      - 24
+      - 168
+      - 720
   tft:
     architecture:
-      hidden_size: 64
       attention_head_size: 4
+      categorical_embedding_dim: 8
       dropout: 0.1
       hidden_continuous_size: 32
-      categorical_embedding_dim: 8
+      hidden_size: 64
+    enabled: true
     training:
-      max_encoder_length: 720  # 30 days
-      min_encoder_length: 168  # 7 days
-      max_prediction_length: 168  # 7 days
-      static_categoricals: ["ESTACAO", "UF"]
-      static_reals: ["LATITUDE", "LONGITUDE", "ALTITUDE"]
-      time_varying_known_categoricals: ["hour", "day", "month", "day_of_week", "season"]
-      time_varying_known_reals: ["time_idx"]
-      time_varying_unknown_categoricals: []
-      time_varying_unknown_reals: [
-        "TEMPERATURA DO AR - BULBO SECO HORARIA °C",
-        "PRECIPITACÃO TOTAL HORÁRIO MM",
-        "PRESSAO ATMOSFERICA AO NIVEL DA ESTACAO HORARIA MB",
-        "UMIDADE RELATIVA DO AR HORARIA %",
-        "VENTO VELOCIDADE HORARIA M/S"
-      ]
-
-# Output configuration
+      max_encoder_length: 720
+      max_prediction_length: 168
+      min_encoder_length: 168
 output:
-  base_dir: "outputs"
-  subdirs:
-    models: "models"
-    predictions: "predictions"
-    plots: "plots"
-    metrics: "metrics"
-    logs: "logs"
-  
+  base_dir: outputs
   forecast:
-    horizon: 87600  # 10 years in hours
-    frequency: "H"
+    confidence_intervals:
+    - 0.1
+    - 0.9
+    frequency: H
+    horizon: 87600
     include_history: true
-    confidence_intervals: [0.1, 0.9]
-  
+  logging:
+    date_format: '%Y-%m-%d %H:%M:%S'
+    format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    level: INFO
   metrics:
-    format: "json"
+    format: json
     include:
-      - rmse
-      - mae
-      - mape
-      - r2
-      - coverage_rate
-      - interval_score
-    
+    - rmse
+    - mae
+    - mape
+    - r2
+    - coverage_rate
+    - interval_score
+  subdirs:
+    logs: logs
+    metrics: metrics
+    models: models
+    plots: plots
+    predictions: predictions
   visualization:
-    style: "classic"
-    context: "paper"
+    color_palette: deep
+    context: paper
     dpi: 300
-    formats: ["png", "html", "svg"]
     figure_sizes:
-      default: [12, 8]
-      wide: [15, 8]
-      tall: [10, 12]
+      default:
+      - 12
+      - 8
+      tall:
+      - 10
+      - 12
+      wide:
+      - 15
+      - 8
     fonts:
-      family: "Arial"
+      family: Arial
       size: 12
       title_size: 14
-    color_palette: "deep"
-    
-  logging:
-    level: "INFO"
-    format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    date_format: "%Y-%m-%d %H:%M:%S"
-
-# Validation and testing
-validation:
-  test_size: 0.2
-  validation_size: 0.1
+    formats:
+    - png
+    - html
+    - svg
+    style: classic
+preprocessing:
+  datetime_format: '%Y-%m-%d %H:%M:%S'
+  invalid_values:
+  - -9999.0
+  - -999.0
+  - -99.0
+  - 9999.0
+  missing_values:
+    interpolation_limit: 24
+    interpolation_methods:
+      categorical: mode
+      numeric: cubic
+    strategy:
+      long_gaps: seasonal_interpolate
+      medium_gaps: interpolate
+      short_gaps: forward_fill
+  outlier_detection:
+    method: zscore
+    rolling_window: 720
+    threshold: 3.0
+  scaling:
+    method: robust
+    parameters:
+      quantile_range:
+      - 0.01
+      - 0.99
+  target_variable: "TEMPERATURA DO AR - BULBO SECO HORARIA \xB0C"
+training:
+  batch_size: 64
   cross_validation:
     n_splits: 5
-    gap: 24  # hours between train and test sets
-  
+    shuffle: false
+  early_stopping_patience: 10
+  epochs: 100
+  learning_rate: 0.001
+  optimizer:
+    parameters:
+      beta1: 0.9
+      beta2: 0.999
+      epsilon: 1.0e-08
+      weight_decay: 0.0001
+    type: adam
+  scheduler:
+    parameters:
+      factor: 0.5
+      min_lr: 1.0e-06
+      mode: min
+      patience: 5
+    type: reduce_on_plateau
+  validation_split: 0.2
+validation:
+  cross_validation:
+    gap: 24
+    n_splits: 5
+  data_quality:
+    correlation_threshold: 0.95
+    missing_threshold: 0.2
+    variance_threshold: 0.01
   metrics_threshold:
-    rmse: 2.0
     mae: 1.5
     mape: 10.0
     r2: 0.8
-    
-  data_quality:
-    missing_threshold: 0.2
-    correlation_threshold: 0.95
-    variance_threshold: 0.01
+    rmse: 2.0
+  test_size: 0.2
+  validation_size: 0.1

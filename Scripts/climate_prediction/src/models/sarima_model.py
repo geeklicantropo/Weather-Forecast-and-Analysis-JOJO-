@@ -9,6 +9,11 @@ import joblib
 from concurrent.futures import ProcessPoolExecutor
 from src.models.base_model import BaseModel
 
+import dask.dataframe as dd
+import gc
+import torch
+from ..utils.gpu_manager import gpu_manager
+
 class SARIMAModel(BaseModel):
     def __init__(self, target_variable, logger, order_ranges=None, seasonal_order_ranges=None):
         super().__init__(target_variable, logger)
@@ -26,32 +31,44 @@ class SARIMAModel(BaseModel):
         self.best_params = None
         self.decomposition = None
         
-    def preprocess_data(self, df: pd.DataFrame):
-        """Prepare data for SARIMA model."""
+    def preprocess_data(self, df: dd.DataFrame):
+        """Prepare data for SARIMA model with Dask support."""
         try:
-            df = df.copy()
-            # Convert index to datetime if not already
-            df.index = pd.to_datetime(df.index)
-            
-            # Ensure hourly frequency and handle missing values
-            df = df.resample('H').mean()
-            df = df.fillna(method='ffill', limit=6)  # Forward fill up to 6 hours
-            df = df.fillna(method='bfill', limit=6)  # Backward fill remaining gaps
-            
-            # Remove remaining NaN if any
-            df = df.dropna()
-            
-            # Get target variable series
+            # Get target variable and compute in chunks
             target_series = df[self.target_variable]
             
+            # Process data in chunks to avoid memory issues
+            chunk_size = 10000  # Smaller chunks for time series analysis
+            processed_chunks = []
+            
+            for chunk in target_series.map_partitions(pd.Series).compute_chunk_sizes():
+                chunk_data = chunk.compute()
+                # Ensure datetime index
+                if not isinstance(chunk_data.index, pd.DatetimeIndex):
+                    chunk_data.index = pd.to_datetime(chunk_data.index)
+                processed_chunks.append(chunk_data)
+            
+            # Combine processed chunks
+            target_series = pd.concat(processed_chunks)
+            target_series = target_series.sort_index()
+            
+            # Resample to ensure regular time intervals
+            target_series = target_series.resample('H').mean()
+            
+            # Handle missing values
+            target_series = target_series.fillna(method='ffill', limit=6)
+            target_series = target_series.fillna(method='bfill', limit=6)
+            
             # Store seasonal decomposition
-            self.decomposition = seasonal_decompose(
-                target_series,
-                period=24,  # 24 hours seasonality
-                extrapolate_trend='freq'
-            )
+            if len(target_series) >= 24:  # Ensure enough data for decomposition
+                self.decomposition = seasonal_decompose(
+                    target_series,
+                    period=24,  # 24 hours seasonality
+                    extrapolate_trend='freq'
+                )
             
             return target_series
+            
         except Exception as e:
             self.logger.error(f"Error in SARIMA preprocessing: {str(e)}")
             raise

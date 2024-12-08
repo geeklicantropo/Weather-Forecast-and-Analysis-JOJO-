@@ -14,14 +14,23 @@ from src.data_processing.feature_engineering import FeatureEngineer
 from src.data_processing.data_validator import DataValidator
 from src.utils.logger import ProgressLogger
 from src.utils.config_manager import ConfigManager
+from src.utils.file_checker import FileChecker
 
 def main():
     # Initialize components
     logger = ProgressLogger(name="DataProcessing")
-    config_manager = ConfigManager("config/model_config.yaml")
+    config_path = os.path.join(project_root, "config", "model_config.yaml")
+    config_manager = ConfigManager(config_path)
     config = config_manager.get_config()
     
-    # Setup directories
+    # Initialize file checker
+    file_checker = FileChecker()
+    
+    # Check if processing is needed
+    if file_checker.check_final_exists():
+        logger.log_info("Final processed files already exist. Skipping processing.")
+        return
+    
     output_dir = os.path.join(project_root, 'outputs/data')
     os.makedirs(output_dir, exist_ok=True)
     
@@ -38,27 +47,43 @@ def main():
         )
         validator = DataValidator(config_manager, logger)
 
-        # Process train data
-        logger.log_info("Processing training data...")
+        # Define file paths
         input_train = os.path.join(output_dir, 'train_full_concatenated.csv.gz')
         processed_train = os.path.join(output_dir, 'train_processed.csv.gz')
         preprocessed_train = os.path.join(output_dir, 'train_preprocessed.csv.gz')
         final_train = os.path.join(output_dir, 'train_final.csv.gz')
-
-        processor.process_file(input_train, processed_train)
-        preprocessor.preprocess(processed_train, preprocessed_train)
-        feature_engineer.process_file(preprocessed_train, final_train)
-
-        # Process test data
-        logger.log_info("Processing test data...")
+        
         input_test = os.path.join(output_dir, 'test_full_concatenated.csv.gz')
         processed_test = os.path.join(output_dir, 'test_processed.csv.gz')
         preprocessed_test = os.path.join(output_dir, 'test_preprocessed.csv.gz')
         final_test = os.path.join(output_dir, 'test_final.csv.gz')
 
-        processor.process_file(input_test, processed_test)
-        preprocessor.preprocess(processed_test, preprocessed_test)
-        feature_engineer.process_file(preprocessed_test, final_test)
+        # Check and process initial files
+        should_process, reason = file_checker.should_process_stage('processed')
+        if should_process:
+            logger.log_info("Processing initial data...")
+            processor.process_file(input_train, processed_train)
+            processor.process_file(input_test, processed_test)
+        else:
+            logger.log_info(f"Skipping initial processing: {reason}")
+
+        # Check and process preprocessing stage
+        should_process, reason = file_checker.should_process_stage('preprocessed')
+        if should_process:
+            logger.log_info("Preprocessing data...")
+            preprocessor.preprocess(processed_train, preprocessed_train)
+            preprocessor.preprocess(processed_test, preprocessed_test)
+        else:
+            logger.log_info(f"Skipping preprocessing: {reason}")
+
+        # Check and process feature engineering stage
+        should_process, reason = file_checker.should_process_stage('final')
+        if should_process:
+            logger.log_info("Engineering features...")
+            feature_engineer.process_file(preprocessed_train, final_train)
+            feature_engineer.process_file(preprocessed_test, final_test)
+        else:
+            logger.log_info(f"Skipping feature engineering: {reason}")
 
         # Validate final datasets
         logger.log_info("Validating processed datasets...")

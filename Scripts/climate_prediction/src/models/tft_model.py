@@ -1,7 +1,11 @@
 # src/models/tft_model.py
 import numpy as np
 import pandas as pd
+import dask.dataframe as dd
+import gc
 import torch
+from ..utils.gpu_manager import gpu_manager
+
 from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet
 from pytorch_forecasting.data import GroupNormalizer, NaNLabelEncoder
 from pytorch_forecasting.metrics import QuantileLoss, RMSE, MAE, MAPE
@@ -10,7 +14,6 @@ from pytorch_lightning.callbacks import EarlyStopping, LearningRateMonitor
 from pytorch_forecasting import TimeSeriesDataSet, GroupNormalizer
 import joblib
 from src.models.base_model import BaseModel
-from src.utils.gpu_manager import gpu_manager
 
 class CustomMetrics:
     def __init__(self):
@@ -61,26 +64,45 @@ class TFTModel(BaseModel):
         
         return df
         
-    def preprocess_data(self, df: pd.DataFrame) -> TimeSeriesDataSet:
-        """Prepare data for TFT model."""
+    def preprocess_data(self, df: dd.DataFrame):
+        """Prepare data for TFT model with Dask support."""
         try:
+            # Create necessary features using Dask
             df = df.copy()
             
-            # Create time index
-            df['time_idx'] = (pd.to_datetime(df.index) - pd.to_datetime(df.index).min()).total_seconds() / 3600
+            # Create time features using Dask operations
+            df['hour'] = df.index.hour
+            df['day'] = df.index.day
+            df['month'] = df.index.month
+            df['day_of_week'] = df.index.dayofweek
+            df['week'] = df.index.isocalendar().week
             
-            # Add temporal features
-            df['hour'] = pd.to_datetime(df.index).hour
-            df['day'] = pd.to_datetime(df.index).day
-            df['month'] = pd.to_datetime(df.index).month
-            df['day_of_week'] = pd.to_datetime(df.index).dayofweek
-            df['week'] = pd.to_datetime(df.index).isocalendar().week
-            df['is_weekend'] = df['day_of_week'].isin([5, 6]).astype(int)
-            df['hour_of_week'] = df['hour'] + df['day_of_week'] * 24
+            # Calculate time index
+            min_date = df.index.min().compute()
+            df['time_idx'] = (df.index - min_date).total_seconds() / 3600
+            
+            # Process static features
+            static_features = ['ESTACAO', 'UF', 'LATITUDE', 'LONGITUDE', 'ALTITUDE']
+            
+            # Convert to pandas in controlled chunks
+            chunk_size = gpu_manager.get_optimal_batch_size()
+            processed_chunks = []
+            
+            for chunk in df.map_partitions(pd.DataFrame).compute_chunk_sizes():
+                chunk_data = chunk.compute()
+                processed_chunks.append(chunk_data)
+                
+                # Clear memory after each chunk
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            
+            # Combine processed chunks
+            processed_df = pd.concat(processed_chunks)
             
             # Create TimeSeriesDataSet
             training = TimeSeriesDataSet(
-                df,
+                processed_df,
                 time_idx="time_idx",
                 target=self.target_variable,
                 group_ids=["ESTACAO"],
@@ -90,8 +112,8 @@ class TFTModel(BaseModel):
                 max_prediction_length=self.forecast_horizon,
                 static_categoricals=["ESTACAO", "UF"],
                 static_reals=["LATITUDE", "LONGITUDE", "ALTITUDE"],
-                time_varying_known_categoricals=["hour", "day", "month", "day_of_week", "is_weekend"],
-                time_varying_known_reals=["time_idx", "hour_of_week", "week"],
+                time_varying_known_categoricals=["hour", "day", "month", "day_of_week"],
+                time_varying_known_reals=["time_idx"],
                 time_varying_unknown_reals=[
                     self.target_variable,
                     "PRECIPITACÃO TOTAL HORÁRIO MM",

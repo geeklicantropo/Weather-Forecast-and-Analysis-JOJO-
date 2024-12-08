@@ -6,7 +6,7 @@ import logging
 from datetime import datetime
 import gc
 import psutil
-import tqdm
+from tqdm import tqdm
 
 class ClimateDataPreprocessor:
     VALID_RANGES = {
@@ -91,16 +91,20 @@ class ClimateDataPreprocessor:
         return df
         
     def _handle_missing_values(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Handle missing values using multiple methods."""
-        # Forward fill short gaps
-        df = df.fillna(method='ffill', limit=6)
+        """Handle missing values in the dataset"""
+        df = df.copy()
         
-        # Interpolate medium gaps using relevant variables
-        for col in self.VALID_RANGES.keys():
-            if col in df.columns:
-                # Get correlated columns for multivariate interpolation
-                corr_cols = self._get_correlated_columns(df, col)
-                df[col] = self._interpolate_with_correlations(df, col, corr_cols)
+        # Only process numeric columns
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        invalid_values = [-9999.0, -999.0, -99.0, 9999.0]
+        
+        for col in numeric_cols:
+            df[col] = df[col].replace(invalid_values, np.nan)
+            df[col] = df[col].astype('float32')
+        
+        # Forward fill and interpolate
+        df[numeric_cols] = df[numeric_cols].ffill(limit=6)
+        df[numeric_cols] = df[numeric_cols].interpolate(method='linear', limit=24, limit_direction='both')
         
         return df
         

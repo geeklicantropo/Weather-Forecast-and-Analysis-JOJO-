@@ -362,6 +362,33 @@ class DataValidator:
                 errors.append(f"Found {duplicates.sum()} duplicate timestamps")
                 
         return errors, warnings
+    
+    def _get_consecutive_missing(self, df: pd.DataFrame) -> dict:
+        """Calculate consecutive missing values for each column."""
+        stats = {}
+        for col in df.columns:
+            if df[col].dtype in [np.number, 'float32', 'float64']:
+                # Get boolean mask of missing values
+                missing_mask = df[col].isnull()
+                # Count consecutive True values
+                consecutive_counts = []
+                current_count = 0
+                
+                for missing in missing_mask:
+                    if missing:
+                        current_count += 1
+                    elif current_count > 0:
+                        consecutive_counts.append(current_count)
+                        current_count = 0
+                        
+                if current_count > 0:
+                    consecutive_counts.append(current_count)
+                    
+                stats[col] = {
+                    'max_consecutive': max(consecutive_counts) if consecutive_counts else 0,
+                    'mean_consecutive': np.mean(consecutive_counts) if consecutive_counts else 0
+                }
+        return stats
 
     def _analyze_missing_data(self, df: pd.DataFrame) -> Dict:
         """Analyze missing data patterns."""

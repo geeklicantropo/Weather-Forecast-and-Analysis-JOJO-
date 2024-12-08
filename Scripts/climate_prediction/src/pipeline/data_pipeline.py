@@ -13,12 +13,15 @@ from ..data_processing.data_validator import DataValidator
 from ..utils.logger import ProgressLogger
 from ..utils.config_manager import ConfigManager
 from ..utils.gpu_manager import gpu_manager
+from ..utils.file_checker import FileChecker
 
 class DataPipeline:
     def __init__(self, config_path: str = "config/model_config.yaml"):
         self.logger = ProgressLogger(name="DataPipeline")
-        self.config = ConfigManager(config_path).get_config()
+        self.config_manager = ConfigManager(config_path)
+        self.config = self.config_manager.get_config()
         self.device = gpu_manager.get_device()
+        self.file_checker = FileChecker()
         self._setup_directories()
         
     def _setup_directories(self):
@@ -34,19 +37,17 @@ class DataPipeline:
             os.makedirs(os.path.join("Scripts/climate_prediction", dir_path), exist_ok=True)
 
     def process_datasets(self) -> Tuple[str, str]:
-        """Process both train and test datasets."""
-        datasets = {
-            'train': 'train_full_concatenated.csv.gz',
-            'test': 'test_full_concatenated.csv.gz'
-        }
-        
+        """Process both train and test datasets with file checks."""
+        # Check if final files already exist
+        if self.file_checker.check_final_exists():
+            self.logger.log_info("Final processed files already exist. Skipping processing.")
+            return (
+                str(self.file_checker.get_file_path('final', 'train')),
+                str(self.file_checker.get_file_path('final', 'test'))
+            )
+
         processed_paths = {}
-        for dataset_type, filename in datasets.items():
-            input_path = f"Scripts/climate_prediction/outputs/data/{filename}"
-            final_path = f"Scripts/climate_prediction/outputs/data/{dataset_type}_final.csv.gz"
-            
-            self.logger.log_info(f"Processing {dataset_type} dataset")
-            
+        try:
             # Initialize processors
             processor = DataProcessor(chunk_size=20000, logger=self.logger)
             preprocessor = ClimateDataPreprocessor(
@@ -57,24 +58,42 @@ class DataPipeline:
                 target_variable=self.config['preprocessing']['target_variable'],
                 logger=self.logger
             )
-            validator = DataValidator(self.config, self.logger)
-            
-            # Process pipeline stages
-            processed_path = f"Scripts/climate_prediction/outputs/data/{dataset_type}_processed.csv.gz"
-            preprocessed_path = f"Scripts/climate_prediction/outputs/data/{dataset_type}_preprocessed.csv.gz"
-            
-            processor.process_file(input_path, processed_path)
-            preprocessor.preprocess(processed_path, preprocessed_path)
-            feature_engineer.process_file(preprocessed_path, final_path)
-            
-            # Validate final dataset
-            validation_report = validator.validate_file(final_path)
-            if not validation_report.is_valid:
-                raise ValueError(f"Validation failed for {dataset_type} dataset")
-            
-            processed_paths[dataset_type] = final_path
-            
-        return processed_paths['train'], processed_paths['test']
+            validator = DataValidator(self.config_manager, self.logger)
+
+            # Process each stage
+            for stage in ['processed', 'preprocessed', 'final']:
+                should_process, reason = self.file_checker.should_process_stage(stage)
+                if not should_process:
+                    self.logger.log_info(f"Skipping {stage} stage: {reason}")
+                    continue
+
+                self.logger.log_info(f"Processing {stage} stage...")
+                for dataset_type in ['train', 'test']:
+                    input_path = str(self.file_checker.get_file_path(
+                        'split' if stage == 'processed' else stage,
+                        dataset_type
+                    ))
+                    output_path = str(self.file_checker.get_file_path(stage, dataset_type))
+
+                    if stage == 'processed':
+                        processor.process_file(input_path, output_path)
+                    elif stage == 'preprocessed':
+                        preprocessor.preprocess(input_path, output_path)
+                    elif stage == 'final':
+                        feature_engineer.process_file(input_path, output_path)
+                        processed_paths[dataset_type] = output_path
+
+            # Validate final datasets
+            for dataset_type in ['train', 'test']:
+                validation_report = validator.validate_file(processed_paths[dataset_type])
+                if not validation_report.is_valid:
+                    raise ValueError(f"Validation failed for {dataset_type} dataset")
+
+            return processed_paths['train'], processed_paths['test']
+
+        except Exception as e:
+            self.logger.log_error(f"Data processing failed: {str(e)}")
+            raise
 
     def get_data_info(self, train_path: str, test_path: str) -> Dict:
         """Get information about processed datasets."""
@@ -89,12 +108,18 @@ class DataPipeline:
         return info
 
     def run_pipeline(self) -> Dict:
-        """Execute complete data processing pipeline."""
+        """Execute complete data processing pipeline with file checks."""
         try:
             self.logger.log_info("Starting data processing pipeline")
             
-            # Process datasets
-            train_path, test_path = self.process_datasets()
+            # Check if final files exist
+            if self.file_checker.check_final_exists():
+                train_path = str(self.file_checker.get_file_path('final', 'train'))
+                test_path = str(self.file_checker.get_file_path('final', 'test'))
+                self.logger.log_info("Using existing processed files")
+            else:
+                # Process datasets
+                train_path, test_path = self.process_datasets()
             
             # Get processing summary
             data_info = self.get_data_info(train_path, test_path)
@@ -111,9 +136,3 @@ class DataPipeline:
         except Exception as e:
             self.logger.log_error(f"Pipeline failed: {str(e)}")
             raise
-
-
-if __name__ == "__main__":
-    pipeline = DataPipeline()
-    results = pipeline.run_pipeline()
-    print(f"Pipeline completed. Processed files at: {results['paths']}")

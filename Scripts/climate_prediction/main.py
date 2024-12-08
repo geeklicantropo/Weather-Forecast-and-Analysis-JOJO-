@@ -16,19 +16,20 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # Add project root to path
-project_root = Path(__file__).parent
+project_root = Path(__file__).parent.parent
 sys.path.append(str(project_root))
-from src.data_processing.data_processing import DataProcessor
-from src.data_processing.preprocessor import ClimateDataPreprocessor
-from src.data_processing.feature_engineering import FeatureEngineer
-from src.data_processing.data_validator import DataValidator
-from src.models.train_evaluate import ModelTrainEvaluate
-from src.utils.logger import ProgressLogger
-from src.utils.config_manager import ConfigManager
-from src.utils.gpu_manager import gpu_manager
-from src.visualization.visualization_manager import VisualizationManager
-from src.pipeline.data_pipeline import DataPipeline
-from src.pipeline.model_pipeline import ModelPipeline
+
+from climate_prediction.src.data_processing.data_processing import DataProcessor
+from climate_prediction.src.data_processing.preprocessor import ClimateDataPreprocessor
+from climate_prediction.src.data_processing.feature_engineering import FeatureEngineer
+from climate_prediction.src.data_processing.data_validator import DataValidator
+from climate_prediction.src.models.train_evaluate import ModelTrainEvaluate
+from climate_prediction.src.utils.logger import ProgressLogger
+from climate_prediction.src.utils.config_manager import ConfigManager
+from climate_prediction.src.utils.gpu_manager import gpu_manager
+from climate_prediction.src.visualization.visualization_manager import VisualizationManager
+from climate_prediction.src.pipeline.data_pipeline import DataPipeline
+from climate_prediction.src.pipeline.model_pipeline import ModelPipeline
 
 class ClimateModelPipeline:
     def __init__(self, config_path: str = "config/model_config.yaml"):
@@ -235,7 +236,7 @@ class ClimateModelPipeline:
 
 def main():
     #data_path = os.path.join(project_root.parent, 'all_data/csvs_concatenated/concatenated_full/full_concatenated.csv.gz')
-    config_path = "config/model_config.yaml"
+    config_path = os.path.join(project_root, "climate_prediction", "config", "model_config.yaml")
     
     try:
         pipeline = ClimateModelPipeline(config_path)

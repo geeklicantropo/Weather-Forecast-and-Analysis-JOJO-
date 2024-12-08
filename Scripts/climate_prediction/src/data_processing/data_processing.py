@@ -7,6 +7,9 @@ from tqdm import tqdm
 import gc
 import psutil
 
+import warnings
+warnings.filterwarnings('ignore', category=FutureWarning)
+
 class DataProcessor:
     def __init__(self, chunk_size: int = 20000, logger=None):
         self.chunk_size = chunk_size
@@ -110,8 +113,26 @@ class DataProcessor:
 
     def _create_datetime_index(self, df: pd.DataFrame) -> pd.DataFrame:
         """Create datetime index from date and time columns"""
+        df = df.copy()
+
+        def standardize_time(time_str):
+            time_str = str(time_str)
+            # Handle common formats
+            if ':' in time_str:  # Already has minutes
+                if len(time_str) == 4:  # Format: H:MM
+                    return f"0{time_str}"
+                return time_str
+            else:  # Only hours
+                time_str = str(time_str).zfill(2)  # Pad with zeros
+                return f"{time_str}:00"
+
+        # Convert date and standardize time format
+        df['DATA YYYY-MM-DD'] = pd.to_datetime(df['DATA YYYY-MM-DD']).dt.strftime('%Y-%m-%d')
+        df['HORA UTC'] = df['HORA UTC'].apply(standardize_time)
+        
+        # Create datetime
         df['DATETIME'] = pd.to_datetime(
-            df['DATA YYYY-MM-DD'].astype(str) + ' ' + df['HORA UTC'],
+            df['DATA YYYY-MM-DD'] + ' ' + df['HORA UTC'],
             format='%Y-%m-%d %H:%M'
         )
         return df.set_index('DATETIME')
@@ -126,9 +147,10 @@ class DataProcessor:
             df[col] = df[col].replace(invalid_values, np.nan)
         
         # Forward fill short gaps (≤ 6 hours)
-        df = df.fillna(method='ffill', limit=6)
+        df = df.ffill(limit=6)
         
         # Interpolate medium gaps (≤ 24 hours)
+        df = df.infer_objects()
         df = df.interpolate(method='linear', limit=24, limit_direction='both')
         
         return df
@@ -142,15 +164,15 @@ class DataProcessor:
             rolling_window = min(24, len(df))  # 24 hours or length of chunk
             rolling_median = df[col].rolling(window=rolling_window, center=True).median()
             rolling_iqr = df[col].rolling(window=rolling_window, center=True).quantile(0.75) - \
-                         df[col].rolling(window=rolling_window, center=True).quantile(0.25)
+                        df[col].rolling(window=rolling_window, center=True).quantile(0.25)
             
             # Define bounds
             lower_bound = rolling_median - 3 * rolling_iqr
             upper_bound = rolling_median + 3 * rolling_iqr
             
-            # Replace outliers with rolling median
+            # Replace outliers with rolling median, ensuring dtype consistency
             mask = (df[col] < lower_bound) | (df[col] > upper_bound)
-            df.loc[mask, col] = rolling_median[mask]
+            df.loc[mask, col] = rolling_median[mask].astype(df[col].dtype)
         
         return df
 
