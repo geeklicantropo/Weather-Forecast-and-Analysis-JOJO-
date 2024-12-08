@@ -33,8 +33,8 @@ class ModelPipeline:
         self.file_checker = FileChecker()
         
     def load_data(self, train_path: str, test_path: str, 
-              chunk_size: int = 20000) -> Tuple[dd.DataFrame, dd.DataFrame]:
-        """Load processed data with memory optimization using Dask."""
+              chunk_size: int = 500000) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Load processed data with memory optimization."""
         if not os.path.exists(train_path) or not os.path.exists(test_path):
             self.logger.log_error("Required data files not found")
             raise FileNotFoundError("Missing required data files")
@@ -43,10 +43,10 @@ class ModelPipeline:
             # Calculate total size and available memory
             total_size = os.path.getsize(train_path) + os.path.getsize(test_path)
             available_memory = psutil.virtual_memory().available
-            gpu_memory = torch.cuda.get_device_properties(0).total_memory if torch.cuda.is_available() else 0
+            gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3 if torch.cuda.is_available() else 0
             
             # Use the smaller of available system memory or GPU memory
-            target_memory = min(available_memory, gpu_memory * 0.8 if gpu_memory else float('inf'))
+            target_memory = min(available_memory, gpu_memory * 1024**3 if gpu_memory else float('inf'))
             
             # If total size is too large, raise error
             if total_size > target_memory * 0.8:  # Use 80% of available memory
@@ -56,47 +56,40 @@ class ModelPipeline:
                 )
             
             # Load data with optimized chunk size
-            optimal_chunk_bytes = int(target_memory * 0.05)  # 5% of memory per chunk
-            min_chunk_bytes = 100 * 1024 * 1024  # 100MB minimum
-            chunk_bytes = max(min_chunk_bytes, min(optimal_chunk_bytes, chunk_size * 1024 * 1024))
+            optimal_chunk_size = int((target_memory * 0.1) / (2 * 1024))  # 10% of memory per chunk
+            chunk_size = max(1000, min(optimal_chunk_size, chunk_size))
             
-            self.logger.log_info(f"Loading data with chunk size: {chunk_bytes / 1024 / 1024:.2f} MB")
+            self.logger.log_info(f"Loading data with chunk size: {chunk_size}")
             
             # Load with dtype optimization
             dtypes = {
                 'PRECIPITACÃO TOTAL HORÁRIO MM': 'float32',
-                'PRESSAO ATMOSFERICA AO NIVEL DA ESTACAO HORARIA MB': 'float32', 
+                'PRESSAO ATMOSFERICA AO NIVEL DA ESTACAO HORARIA MB': 'float32',
                 'TEMPERATURA DO AR - BULBO SECO HORARIA °C': 'float32',
                 'UMIDADE RELATIVA DO AR HORARIA %': 'float32',
                 'VENTO VELOCIDADE HORARIA M/S': 'float32',
                 'LATITUDE': 'float32',
                 'LONGITUDE': 'float32',
-                'ALTITUDE': 'float32'  
+                'ALTITUDE': 'float32'
             }
             
-            # Load and process data in chunks
-            train_chunks = []
-            for chunk in dd.read_csv(train_path, compression='gzip', dtype=dtypes, blocksize=chunk_bytes):
-                chunk['DATETIME'] = dd.to_datetime(chunk['DATA YYYY-MM-DD'] + ' ' + chunk['HORA UTC'])
-                chunk = chunk.set_index('DATETIME')
-                train_chunks.append(chunk)
-                del chunk  # Free memory
-                gc.collect()  # Force garbage collection
+            # Load train data
+            train_data = pd.read_csv(train_path, compression='gzip', dtype=dtypes)
+            if 'DATETIME' in train_data.columns:
+                train_data['DATETIME'] = pd.to_datetime(train_data['DATETIME'])
+                train_data.set_index('DATETIME', inplace=True)
+            else:
+                train_data['DATETIME'] = pd.to_datetime(train_data['DATA YYYY-MM-DD'])
+                train_data.set_index('DATETIME', inplace=True)
             
-            test_chunks = []
-            for chunk in dd.read_csv(test_path, compression='gzip', dtype=dtypes, blocksize=chunk_bytes):
-                chunk['DATETIME'] = dd.to_datetime(chunk['DATA YYYY-MM-DD'] + ' ' + chunk['HORA UTC'])
-                chunk = chunk.set_index('DATETIME')
-                test_chunks.append(chunk)
-                del chunk  # Free memory
-                gc.collect()  # Force garbage collection
-            
-            # Combine processed chunks
-            train_data = dd.concat(train_chunks)
-            test_data = dd.concat(test_chunks)
-            
-            self.logger.log_info(f"Loaded train data: {len(train_data)} rows, {train_data.npartitions} partitions")
-            self.logger.log_info(f"Loaded test data: {len(test_data)} rows, {test_data.npartitions} partitions")
+            # Load test data
+            test_data = pd.read_csv(test_path, compression='gzip', dtype=dtypes)
+            if 'DATETIME' in test_data.columns:
+                test_data['DATETIME'] = pd.to_datetime(test_data['DATETIME'])
+                test_data.set_index('DATETIME', inplace=True)
+            else:
+                test_data['DATETIME'] = pd.to_datetime(test_data['DATA YYYY-MM-DD'])
+                test_data.set_index('DATETIME', inplace=True)
             
             return train_data, test_data
             

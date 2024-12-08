@@ -6,6 +6,7 @@ from typing import Dict, List, Tuple
 from tqdm import tqdm
 import gc
 import psutil
+import torch
 
 import warnings
 warnings.filterwarnings('ignore', category=FutureWarning)
@@ -126,16 +127,26 @@ class DataProcessor:
                 time_str = str(time_str).zfill(2)  # Pad with zeros
                 return f"{time_str}:00"
 
-        # Convert date and standardize time format
-        df['DATA YYYY-MM-DD'] = pd.to_datetime(df['DATA YYYY-MM-DD']).dt.strftime('%Y-%m-%d')
-        df['HORA UTC'] = df['HORA UTC'].apply(standardize_time)
-        
-        # Create datetime
-        df['DATETIME'] = pd.to_datetime(
-            df['DATA YYYY-MM-DD'] + ' ' + df['HORA UTC'],
-            format='%Y-%m-%d %H:%M'
-        )
-        return df.set_index('DATETIME')
+        try:
+            # Clean date column by removing time portion if present
+            df['DATA YYYY-MM-DD'] = df['DATA YYYY-MM-DD'].str.split(' ').str[0]
+            
+            # Convert date and standardize time format
+            df['DATA YYYY-MM-DD'] = pd.to_datetime(df['DATA YYYY-MM-DD'], format='%Y-%m-%d')
+            df['HORA UTC'] = df['HORA UTC'].apply(standardize_time)
+            
+            # Create datetime by combining date and time
+            df['DATETIME'] = pd.to_datetime(
+                df['DATA YYYY-MM-DD'].dt.strftime('%Y-%m-%d') + ' ' + df['HORA UTC']
+            )
+            
+            return df.set_index('DATETIME')
+            
+        except Exception as e:
+            self.logger.error(f"DateTime conversion failed: {str(e)}")
+            # Return original DataFrame with basic datetime conversion
+            df['DATETIME'] = pd.to_datetime(df['DATA YYYY-MM-DD'], format='mixed')
+            return df.set_index('DATETIME')
 
     def _handle_missing_values(self, df: pd.DataFrame) -> pd.DataFrame:
         """Handle missing values in the dataset"""
@@ -179,9 +190,15 @@ class DataProcessor:
     def _cleanup_memory(self):
         """Force garbage collection and monitor memory usage"""
         gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         memory_usage = psutil.Process().memory_info().rss / 1024 / 1024  # MB
         if memory_usage > 1024:  # If usage exceeds 1GB
             self.logger.warning(f"High memory usage detected: {memory_usage:.2f} MB")
+            # Force DataFrame cleanup
+            del self.buffer
+            self.buffer = pd.DataFrame()
+            gc.collect()
 
 if __name__ == "__main__":
     import logging

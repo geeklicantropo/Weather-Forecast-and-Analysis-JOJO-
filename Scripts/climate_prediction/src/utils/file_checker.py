@@ -2,12 +2,17 @@
 import os
 from typing import Dict, List, Tuple
 from pathlib import Path
+import logging
 
 class FileChecker:
-    """Utility class to check and validate pipeline file dependencies."""
-    
     def __init__(self, base_dir: str = "Scripts/climate_prediction/outputs/data"):
         self.base_dir = Path(base_dir)
+        self.stage_dependencies = {
+            'split': [],
+            'processed': ['split'],
+            'preprocessed': ['processed'],
+            'final': ['preprocessed']
+        }
         self.required_files = {
             'split': {
                 'train': 'train_full_concatenated.csv.gz',
@@ -29,61 +34,90 @@ class FileChecker:
         
     def get_file_path(self, stage: str, dataset: str) -> Path:
         """Get full path for a specific file."""
+        if stage not in self.required_files or dataset not in self.required_files[stage]:
+            raise ValueError(f"Invalid stage '{stage}' or dataset '{dataset}'")
         return self.base_dir / self.required_files[stage][dataset]
     
-    def check_files(self, stage: str) -> Dict[str, bool]:
-        """Check existence of files for a specific stage."""
+    def check_stage_files(self, stage: str, dataset_type: str = None) -> Dict[str, bool]:
+        """Check existence of files for a specific stage and optionally specific dataset type."""
         results = {}
         for dataset, filename in self.required_files[stage].items():
+            if dataset_type and dataset != dataset_type:
+                continue
             file_path = self.base_dir / filename
             results[dataset] = file_path.exists()
+            if file_path.exists():
+                # Check if file is not empty
+                if file_path.stat().st_size == 0:
+                    results[dataset] = False
         return results
     
-    def check_dependencies(self, target_stage: str) -> Tuple[bool, List[str]]:
-        """Check if all necessary files exist for a given stage."""
-        stage_order = ['split', 'processed', 'preprocessed', 'final']
-        target_idx = stage_order.index(target_stage)
-        
-        missing_files = []
-        for stage in stage_order[:target_idx + 1]:
-            stage_files = self.check_files(stage)
-            for dataset, exists in stage_files.items():
-                if not exists:
-                    file_path = self.get_file_path(stage, dataset)
-                    missing_files.append(str(file_path))
-        
-        return len(missing_files) == 0, missing_files
+    def check_stage_dependencies(self, target_stage: str, dataset_type: str = None) -> Tuple[bool, str]:
+        """Check if all dependencies for a stage are met."""
+        if target_stage not in self.stage_dependencies:
+            return False, f"Invalid stage: {target_stage}"
+            
+        for dep_stage in self.stage_dependencies[target_stage]:
+            stage_files = self.check_stage_files(dep_stage, dataset_type)
+            if not all(stage_files.values()):
+                missing = [f for f, exists in stage_files.items() if not exists]
+                return False, f"Missing {dep_stage} files: {', '.join(missing)}"
+                
+        return True, "All dependencies met"
     
-    def check_final_exists(self) -> bool:
-        """Check if final files exist, indicating previous processing is complete."""
-        final_files = self.check_files('final')
-        return all(final_files.values())
+    def should_process_stage(self, stage: str, dataset_type: str = None) -> Tuple[bool, str]:
+        """Determine if a stage needs processing and why."""
+        # Check if target files already exist
+        existing_files = self.check_stage_files(stage, dataset_type)
+        if all(existing_files.values()):
+            return False, f"Files for stage '{stage}' already exist and are valid"
+            
+        # Check dependencies
+        deps_ok, deps_message = self.check_stage_dependencies(stage, dataset_type)
+        if not deps_ok:
+            return False, deps_message
+            
+        return True, "Processing needed"
     
-    def get_last_completed_stage(self) -> str:
-        """Determine the last completed processing stage."""
-        stage_order = ['split', 'processed', 'preprocessed', 'final']
+    def get_last_completed_stage(self, dataset_type: str = None) -> str:
+        """Determine the last completely processed stage."""
+        stage_order = ['final', 'preprocessed', 'processed', 'split']
         
-        for stage in reversed(stage_order):
-            stage_files = self.check_files(stage)
-            if all(stage_files.values()):
+        for stage in stage_order:
+            if all(self.check_stage_files(stage, dataset_type).values()):
                 return stage
         
         return None
     
-    def should_process_stage(self, stage: str) -> Tuple[bool, str]:
-        """Determine if a stage needs processing and why."""
-        # Check if final files already exist
-        if self.check_final_exists():
-            return False, "Final files already exist. Processing not needed."
+    def validate_file_size_reduction(self, prev_stage: str, curr_stage: str, 
+                                   dataset_type: str) -> bool:
+        """Verify file size reduction between stages (specifically for aggregation)."""
+        prev_file = self.get_file_path(prev_stage, dataset_type)
+        curr_file = self.get_file_path(curr_stage, dataset_type)
+        
+        if not (prev_file.exists() and curr_file.exists()):
+            return False
             
-        # Check dependencies
-        deps_ok, missing = self.check_dependencies(stage)
-        if not deps_ok:
-            return True, f"Missing dependency files: {', '.join(missing)}"
+        prev_size = prev_file.stat().st_size
+        curr_size = curr_file.stat().st_size
+        
+        # For preprocessed stage, expect significant reduction due to aggregation
+        if curr_stage == 'preprocessed':
+            return curr_size < (prev_size * 0.9)  # Expect at least 10% reduction
             
-        # Check if current stage files exist
-        stage_files = self.check_files(stage)
-        if all(stage_files.values()):
-            return False, f"Files for stage '{stage}' already exist."
+        return True
+    
+    def check_final_exists(self) -> bool:
+        """Check if final processed files exist and are valid."""
+        final_files = self.check_stage_files('final')
+        if not all(final_files.values()):
+            return False
             
-        return True, "Processing needed."
+        # Verify file sizes
+        for dataset, exists in final_files.items():
+            if exists:
+                file_path = self.get_file_path('final', dataset)
+                if file_path.stat().st_size == 0:
+                    return False
+                    
+        return True

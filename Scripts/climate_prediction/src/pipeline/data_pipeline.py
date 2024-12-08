@@ -24,6 +24,14 @@ class DataPipeline:
         self.file_checker = FileChecker()
         self._setup_directories()
         
+        # Define stage dependencies
+        self.stage_dependencies = {
+            'split': [],
+            'processed': ['split'],
+            'preprocessed': ['processed'],
+            'final': ['preprocessed']
+        }
+        
     def _setup_directories(self):
         """Create necessary directories."""
         dirs = [
@@ -37,18 +45,8 @@ class DataPipeline:
             os.makedirs(os.path.join("Scripts/climate_prediction", dir_path), exist_ok=True)
 
     def process_datasets(self) -> Tuple[str, str]:
-        """Process both train and test datasets with file checks."""
-        # Check if final files already exist
-        if self.file_checker.check_final_exists():
-            self.logger.log_info("Final processed files already exist. Skipping processing.")
-            return (
-                str(self.file_checker.get_file_path('final', 'train')),
-                str(self.file_checker.get_file_path('final', 'test'))
-            )
-
-        processed_paths = {}
+        """Process both train and test datasets with proper dependency checks."""
         try:
-            # Initialize processors
             processor = DataProcessor(chunk_size=20000, logger=self.logger)
             preprocessor = ClimateDataPreprocessor(
                 target_variable=self.config['preprocessing']['target_variable'],
@@ -60,36 +58,48 @@ class DataPipeline:
             )
             validator = DataValidator(self.config_manager, self.logger)
 
-            # Process each stage
-            for stage in ['processed', 'preprocessed', 'final']:
-                should_process, reason = self.file_checker.should_process_stage(stage)
-                if not should_process:
-                    self.logger.log_info(f"Skipping {stage} stage: {reason}")
-                    continue
+            stages = ['processed', 'preprocessed', 'final']
+            for dataset_type in ['train', 'test']:
+                for stage in stages:
+                    # Get dependency stage
+                    dep_stage = self.stage_dependencies[stage][0]
+                    
+                    # Check if input file exists
+                    input_path = str(self.file_checker.get_file_path(dep_stage, dataset_type))
+                    if not os.path.exists(input_path):
+                        raise FileNotFoundError(f"Required input file missing: {input_path}")
 
-                self.logger.log_info(f"Processing {stage} stage...")
-                for dataset_type in ['train', 'test']:
-                    input_path = str(self.file_checker.get_file_path(
-                        'split' if stage == 'processed' else stage,
-                        dataset_type
-                    ))
+                    # Check if processing is needed
                     output_path = str(self.file_checker.get_file_path(stage, dataset_type))
+                    if os.path.exists(output_path):
+                        self.logger.log_info(f"Skipping {stage} stage for {dataset_type}: File exists")
+                        continue
 
+                    self.logger.log_info(f"Processing {stage} stage for {dataset_type} data...")
+
+                    # Process based on stage
                     if stage == 'processed':
                         processor.process_file(input_path, output_path)
+                        validation_report = validator.validate_file(output_path)
+                        if not validation_report.is_valid:
+                            raise ValueError(f"Validation failed for {dataset_type} in {stage} stage")
+                            
                     elif stage == 'preprocessed':
                         preprocessor.preprocess(input_path, output_path)
-                    elif stage == 'final':
+                        # Skip strict validation for preprocessed stage
+                        if not os.path.exists(output_path):
+                            raise FileNotFoundError(f"Failed to create output file: {output_path}")
+                            
+                    else:  # final
                         feature_engineer.process_file(input_path, output_path)
-                        processed_paths[dataset_type] = output_path
+                        validation_report = validator.validate_file(output_path)
+                        if not validation_report.is_valid:
+                            raise ValueError(f"Validation failed for {dataset_type} in {stage} stage")
 
-            # Validate final datasets
-            for dataset_type in ['train', 'test']:
-                validation_report = validator.validate_file(processed_paths[dataset_type])
-                if not validation_report.is_valid:
-                    raise ValueError(f"Validation failed for {dataset_type} dataset")
-
-            return processed_paths['train'], processed_paths['test']
+            return (
+                str(self.file_checker.get_file_path('final', 'train')),
+                str(self.file_checker.get_file_path('final', 'test'))
+            )
 
         except Exception as e:
             self.logger.log_error(f"Data processing failed: {str(e)}")
