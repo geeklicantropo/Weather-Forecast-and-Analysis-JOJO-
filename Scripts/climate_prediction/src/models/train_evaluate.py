@@ -93,7 +93,7 @@ class ModelTrainEvaluate:
                             training_histories[name] = history
                         
                         # Save model checkpoint
-                        model_path = f"outputs/models/{name}_model_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                        model_path = f"Scripts/climate_prediction/outputs/models/{name}_model_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
                         model.save_model(model_path)
                         
                     except Exception as e:
@@ -134,7 +134,7 @@ class ModelTrainEvaluate:
                     )
                     
                     # Save predictions
-                    predictions_path = f"outputs/predictions/{name}_predictions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                    predictions_path = f"Scripts/climate_prediction/outputs/predictions/{name}_predictions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
                     predictions.to_csv(predictions_path)
                     
                 except Exception as e:
@@ -170,7 +170,7 @@ class ModelTrainEvaluate:
                         future_predictions[name] = predictions
                     
                     # Save predictions
-                    predictions_path = f"outputs/predictions/{name}_future_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                    predictions_path = f"Scripts/climate_prediction/outputs/predictions/{name}_future_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
                     predictions.to_csv(predictions_path)
                     
                 except Exception as e:
@@ -219,11 +219,12 @@ class ModelTrainEvaluate:
 
 if __name__ == "__main__":
     # Example usage
-    config_path = "config/model_config.yaml"
+    config_path = "Scripts/climate_prediction/config/model_config.yaml"
     pipeline = ModelTrainEvaluate(config_path)
     
     # Load your data
-    data = pd.read_csv("outputs/data/processed_data.csv.gz")
+    train_data = pd.read_csv("Scripts/climate_prediction/outputs/data/train_final.csv.gz")
+    test_data = pd.read_csv("Scripts/climate_prediction/outputs/data/test_final.csv.gz")
     
     # Run pipeline
-    results = pipeline.run_pipeline(data)
+    results = pipeline.run_pipeline(train_data, test_data)

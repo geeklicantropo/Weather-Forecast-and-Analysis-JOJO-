@@ -51,11 +51,11 @@ class DataLoader:
             gpu_memory = torch.cuda.get_device_properties(0).total_memory
             available_memory = min(available_memory, gpu_memory * 0.8)  # Use 80% of GPU memory
         
-        # Target 10% of available memory per chunk
-        memory_limit = available_memory * 0.1
+        # Target 50% of available memory per chunk
+        memory_limit = available_memory * 0.5
         estimated_row_size = 1024  # bytes per row
         chunk_size = int(memory_limit / estimated_row_size)
-        return max(5000, min(chunk_size, 20000))
+        return max(5000, min(chunk_size, 500000))
     
     def _check_gpu_availability(self) -> Tuple[bool, Optional[str]]:
         """Check GPU availability and memory capacity."""

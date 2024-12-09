@@ -10,6 +10,7 @@ import numpy as np
 import dask.dataframe as dd
 import gc
 from dask.distributed import Client, LocalCluster
+from tqdm import tqdm
 
 
 from ..models.lstm_model import LSTMModel
@@ -36,8 +37,7 @@ class ModelPipeline:
         self.file_checker = FileChecker()
         self.prediction_manager = PredictionManager(self.logger)
         
-    def load_data(self, train_path: str, test_path: str, 
-              chunk_size: int = 500000) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    def load_data(self, train_path: str, test_path: str, chunk_size: int = 100000) -> Tuple[dd.DataFrame, dd.DataFrame]:
         """Load processed data with memory optimization."""
         if not os.path.exists(train_path) or not os.path.exists(test_path):
             self.logger.log_error("Required data files not found")
@@ -52,20 +52,13 @@ class ModelPipeline:
             # Use the smaller of available system memory or GPU memory
             target_memory = min(available_memory, gpu_memory * 1024**3 if gpu_memory else float('inf'))
             
-            # If total size is too large, raise error
-            if total_size > target_memory * 0.8:  # Use 80% of available memory
-                raise MemoryError(
-                    f"Data size ({total_size/1024**3:.2f} GB) exceeds available memory "
-                    f"({target_memory/1024**3:.2f} GB). Consider processing in smaller chunks."
-                )
-            
-            # Load data with optimized chunk size
+            # Calculate optimal chunk size
             optimal_chunk_size = int((target_memory * 0.1) / (2 * 1024))  # 10% of memory per chunk
             chunk_size = max(1000, min(optimal_chunk_size, chunk_size))
             
             self.logger.log_info(f"Loading data with chunk size: {chunk_size}")
             
-            # Load with dtype optimization
+            # Define optimized dtypes
             dtypes = {
                 'PRECIPITACÃO TOTAL HORÁRIO MM': 'float32',
                 'PRESSAO ATMOSFERICA AO NIVEL DA ESTACAO HORARIA MB': 'float32',
@@ -76,24 +69,51 @@ class ModelPipeline:
                 'LONGITUDE': 'float32',
                 'ALTITUDE': 'float32'
             }
+
+            # Load in chunks with memory monitoring
+            train_chunks = []
+            test_chunks = []
             
             # Load train data
-            train_data = pd.read_csv(train_path, compression='gzip', dtype=dtypes)
-            if 'DATETIME' in train_data.columns:
-                train_data['DATETIME'] = pd.to_datetime(train_data['DATETIME'])
-                train_data.set_index('DATETIME', inplace=True)
-            else:
-                train_data['DATETIME'] = pd.to_datetime(train_data['DATA YYYY-MM-DD'])
-                train_data.set_index('DATETIME', inplace=True)
+            self.logger.log_info("Loading train data...")
+            for chunk in pd.read_csv(train_path, compression='gzip', chunksize=chunk_size, dtype=dtypes):
+                if 'DATETIME' in chunk.columns:
+                    chunk['DATETIME'] = pd.to_datetime(chunk['DATETIME'])
+                    chunk.set_index('DATETIME', inplace=True)
+                else:
+                    chunk['DATETIME'] = pd.to_datetime(chunk['DATA YYYY-MM-DD'])
+                    chunk.set_index('DATETIME', inplace=True)
+                train_chunks.append(chunk)
+                
+                if psutil.virtual_memory().percent > 80:
+                    self.logger.log_warning("Memory usage high, concatenating chunks")
+                    train_chunks = [dd.concat(train_chunks)]
+                    gc.collect()
+            
+            # Concatenate train chunks into a single Dask DataFrame
+            train_data = dd.concat(train_chunks)
             
             # Load test data
-            test_data = pd.read_csv(test_path, compression='gzip', dtype=dtypes)
-            if 'DATETIME' in test_data.columns:
-                test_data['DATETIME'] = pd.to_datetime(test_data['DATETIME'])
-                test_data.set_index('DATETIME', inplace=True)
-            else:
-                test_data['DATETIME'] = pd.to_datetime(test_data['DATA YYYY-MM-DD'])
-                test_data.set_index('DATETIME', inplace=True)
+            self.logger.log_info("Loading test data...")
+            for chunk in pd.read_csv(test_path, compression='gzip', chunksize=chunk_size, dtype=dtypes):
+                if 'DATETIME' in chunk.columns:
+                    chunk['DATETIME'] = pd.to_datetime(chunk['DATETIME'])
+                    chunk.set_index('DATETIME', inplace=True)
+                else:
+                    chunk['DATETIME'] = pd.to_datetime(chunk['DATA YYYY-MM-DD'])
+                    chunk.set_index('DATETIME', inplace=True)
+                test_chunks.append(chunk)
+                
+                if psutil.virtual_memory().percent > 80:
+                    self.logger.log_warning("Memory usage high, concatenating chunks")
+                    test_chunks = [dd.concat(test_chunks)]
+                    gc.collect()
+
+            # Concatenate test chunks into a single Dask DataFrame
+            test_data = dd.concat(test_chunks)
+            
+            self.logger.log_info(f"Loaded train data: {len(train_data)} rows")
+            self.logger.log_info(f"Loaded test data: {len(test_data)} rows")
             
             return train_data, test_data
             
@@ -101,9 +121,29 @@ class ModelPipeline:
             self.logger.log_error(f"Error loading data: {str(e)}")
             raise
         
-    def train_models(self, train_data: pd.DataFrame, 
-                    test_data: pd.DataFrame) -> Dict[str, object]:
-        """Train all models with provided data."""
+    def _setup_directories(self):
+        """Create necessary directories."""
+        dirs = [
+            'outputs/models',
+            'outputs/predictions',
+            'outputs/plots',
+            'outputs/metrics',
+            'outputs/logs'
+        ]
+        for dir_path in dirs:
+            os.makedirs(os.path.join("Scripts/climate_prediction", dir_path), exist_ok=True)
+
+    def _handle_existing_model(self, model_path: str) -> bool:
+        """Check if model exists and handle symlink."""
+        if os.path.exists(model_path):
+            if os.path.islink(model_path):
+                os.remove(model_path)
+                return True
+            return True
+        return False
+
+    def train_models(self, train_data: pd.DataFrame, test_data: pd.DataFrame) -> Dict[str, object]:
+        """Train models with provided data."""
         if not self.file_checker.check_final_exists():
             raise ValueError("Final processed data files not found")
 
@@ -114,38 +154,62 @@ class ModelPipeline:
             'tft': TFTModel
         }
         
-        for name, model_class in model_classes.items():
-            self.logger.log_info(f"Training {name.upper()} model")
-            
-            # Check if model already exists
-            model_path = f"Scripts/climate_prediction/outputs/models/{name}_model_latest"
-            if os.path.exists(model_path):
-                self.logger.log_info(f"Loading existing {name} model")
-                model = model_class(self.target_variable, self.logger)
-                model.load_model(model_path)
-                models[name] = model
-                continue
-            
-            model = model_class(self.target_variable, self.logger)
-            
-            # Process data for model
-            processed_train = model.preprocess_data(train_data)
-            processed_test = model.preprocess_data(test_data)
-            
-            # Train model
-            model.train(processed_train, processed_test)
-            models[name] = model
-            
-            # Save model
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            save_path = f"Scripts/climate_prediction/outputs/models/{name}_model_{timestamp}"
-            model.save_model(save_path)
-            
-            # Create latest symlink
-            if os.path.exists(model_path):
-                os.remove(model_path)
-            os.symlink(save_path, model_path)
-            
+        with tqdm(total=len(model_classes), desc="Training models") as pbar:
+            for name, model_class in model_classes.items():
+                self.logger.log_info(f"Training {name.upper()} model")
+                
+                # Check if model already exists
+                model_path = f"Scripts/climate_prediction/outputs/models/{name}_model_latest"
+                if os.path.exists(model_path):
+                    self.logger.log_info(f"Loading existing {name} model")
+                    model = model_class(self.target_variable, self.logger)
+                    model.load_model(model_path)
+                    models[name] = model
+                    pbar.update(1)
+                    continue
+                
+                try:
+                    model = model_class(self.target_variable, self.logger)
+                    
+                    # Process data for model with progress tracking
+                    with tqdm(total=2, desc=f"Processing {name} data", leave=False) as proc_pbar:
+                        processed_train = model.preprocess_data(train_data)
+                        proc_pbar.update(1)
+                        processed_test = model.preprocess_data(test_data)
+                        proc_pbar.update(1)
+                    
+                    # Train with progress tracking
+                    with tqdm(total=self.config['training']['epochs'], 
+                            desc=f"{name} epochs", leave=False) as epoch_pbar:
+                        def update_progress(epoch, metrics):
+                            epoch_pbar.update(1)
+                            epoch_pbar.set_postfix(metrics)
+                        model.train(processed_train, processed_test, 
+                                progress_callback=update_progress)
+                    
+                    models[name] = model
+                    
+                    # Save model with proper symlink handling
+                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    save_path = f"Scripts/climate_prediction/outputs/models/{name}_model_{timestamp}"
+                    model.save_model(save_path)
+                    
+                    # Update symlink safely
+                    if os.path.exists(model_path):
+                        if os.path.islink(model_path):
+                            os.remove(model_path)
+                    os.symlink(save_path, model_path)
+                    
+                except Exception as e:
+                    self.logger.log_error(f"Error training {name} model: {str(e)}")
+                    raise  # Stop execution if any model fails
+                    
+                pbar.update(1)
+                
+                # Clear GPU memory after each model
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        
         return models
         
     def evaluate_models(self, models: Dict[str, object], 

@@ -7,9 +7,12 @@ from tqdm.auto import tqdm
 from functools import wraps
 
 class ProgressLogger:
-    def __init__(self, name='climate_prediction', log_dir='outputs/logs'):
+    def __init__(self, name='climate_prediction', log_dir='Scripts/climate_prediction/outputs/logs'):
         self.log_dir = log_dir
-        os.makedirs(log_dir, exist_ok=True)
+        
+        # Create log directory if it doesn't exist
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir)
         
         # Create logger
         self.logger = logging.getLogger(name)

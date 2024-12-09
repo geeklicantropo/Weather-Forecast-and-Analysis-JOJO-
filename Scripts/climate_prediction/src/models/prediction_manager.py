@@ -15,7 +15,7 @@ from ..utils.gpu_manager import gpu_manager
 from ..visualization.visualization_manager import VisualizationManager
 
 class PredictionManager:
-    def __init__(self, logger, output_dir="outputs/predictions"):
+    def __init__(self, logger, output_dir="Scripts/climate_prediction/outputs/predictions"):
         self.logger = logger
         self.output_dir = output_dir
         self.device = gpu_manager.get_device()

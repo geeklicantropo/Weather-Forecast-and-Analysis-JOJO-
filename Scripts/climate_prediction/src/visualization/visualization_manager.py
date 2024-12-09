@@ -40,7 +40,7 @@ class VisualizationManager:
     def save_plot(self, fig, name: str, formats: List[str] = ['png', 'pdf', 'html']):
         """Save plot in multiple formats."""
         try:
-            base_path = f"{self.output_dir}/{name}"
+            base_path = f"Scripts/climate_prediction/outputs/plots/{name}"
             for fmt in formats:
                 if fmt == 'html' and isinstance(fig, go.Figure):
                     fig.write_html(f"{base_path}.html")

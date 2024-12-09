@@ -17,6 +17,10 @@ from ..utils.gpu_manager import gpu_manager
 from tqdm import tqdm
 import psutil
 
+from datetime import datetime
+from typing import Dict, Optional, Tuple, Any
+import os
+
 class SARIMAModel(BaseModel):
     def __init__(self, target_variable, logger, order_ranges=None, seasonal_order_ranges=None):
         super().__init__(target_variable, logger)
@@ -36,13 +40,14 @@ class SARIMAModel(BaseModel):
         
     def _convert_to_dask(self, df: pd.DataFrame) -> dd.DataFrame:
         """Convert pandas DataFrame to Dask DataFrame if not already."""
+        if not isinstance(df, (pd.DataFrame, dd.DataFrame)):
+            return df
         if isinstance(df, dd.DataFrame):
             return df
         
-        # Calculate memory usage and optimal chunk size
-        memory_usage = df.memory_usage(deep=True).sum()
-        chunk_bytes = 128 * 1024 * 1024  # 128MB chunks
-        npartitions = max(1, memory_usage // chunk_bytes)
+        # Calculate optimal partitions
+        chunk_bytes = 128 * 1024 * 1024
+        npartitions = max(1, len(df) // (chunk_bytes // df.memory_usage(deep=True).mean()))
         
         return dd.from_pandas(df, npartitions=int(npartitions))
     
@@ -51,7 +56,7 @@ class SARIMAModel(BaseModel):
             self.logger.log_info(f"Starting SARIMA preprocessing for dataset of size {len(df):,} rows")
             
             ddf = self._convert_to_dask(df)
-            batch_size = 50000
+            batch_size = 500000
             n_partitions = max(1, len(df) // batch_size)
             ddf = ddf.repartition(npartitions=n_partitions)
             
@@ -141,8 +146,16 @@ class SARIMAModel(BaseModel):
         self.best_params = best_params
         return best_params
         
-    def train(self, train_data, validation_data=None):
+    def train(self, train_data: pd.DataFrame, validation_data: Optional[pd.DataFrame] = None) -> Dict:
+        """Train SARIMA model with optimized parameters."""
         try:
+            # Check for existing model
+            model_path = os.path.join("Scripts/climate_prediction/outputs/models", "sarima_model_latest")
+            if os.path.exists(model_path):
+                self.logger.log_info("Loading existing SARIMA model")
+                self._load_model_data(model_path)
+                return {}
+                
             train_series = self.preprocess_data(train_data)
             
             # Find optimal parameters if not set
@@ -161,20 +174,35 @@ class SARIMAModel(BaseModel):
             
             self.fitted_model = self.model.fit(disp=False)
             
-            # Calculate and store residuals
+            # Store residuals and feature importance
             self.residuals = self.fitted_model.resid
-            
-            # Store feature importance based on model coefficients
             self.feature_importance = pd.Series(
                 self.fitted_model.params,
                 index=self.fitted_model.param_names
             ).abs().sort_values(ascending=False)
             
-            self.logger.log_info("SARIMA model training completed")
-            self.logger.log_info(f"Final model parameters: {self.best_params}")
-            
-            # Model diagnostics
+            # Perform diagnostics
             self._perform_diagnostics()
+            
+            # Save model
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            save_path = os.path.join("Scripts/climate_prediction/outputs/models", f"sarima_model_{timestamp}")
+            self._save_model_data(save_path)
+            
+            # Create/update latest symlink
+            latest_path = os.path.join("Scripts/climate_prediction/outputs/models", "sarima_model_latest")
+            if os.path.exists(latest_path):
+                os.remove(latest_path)
+            os.symlink(save_path, latest_path)
+            
+            # Return training metadata
+            return {
+                'order': order,
+                'seasonal_order': seasonal_order,
+                'aic': self.fitted_model.aic,
+                'bic': self.fitted_model.bic,
+                'residual_std': self.residuals.std()
+            }
             
         except Exception as e:
             self.logger.log_error(f"Training error: {str(e)}")

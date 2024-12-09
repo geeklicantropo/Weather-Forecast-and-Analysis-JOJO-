@@ -7,6 +7,9 @@ import torch
 from ..utils.gpu_manager import gpu_manager
 from tqdm import tqdm
 import psutil
+from datetime import datetime
+from typing import Dict, Optional, Tuple, Any
+import os
 
 from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet
 from pytorch_forecasting.data import GroupNormalizer, NaNLabelEncoder
@@ -67,13 +70,14 @@ class TFTModel(BaseModel):
         
     def _convert_to_dask(self, df: pd.DataFrame) -> dd.DataFrame:
         """Convert pandas DataFrame to Dask DataFrame if not already."""
+        if not isinstance(df, (pd.DataFrame, dd.DataFrame)):
+            return df
         if isinstance(df, dd.DataFrame):
             return df
         
-        # Calculate memory usage and optimal chunk size
-        memory_usage = df.memory_usage(deep=True).sum()
-        chunk_bytes = 128 * 1024 * 1024  # 128MB chunks
-        npartitions = max(1, memory_usage // chunk_bytes)
+        # Calculate optimal partitions
+        chunk_bytes = 128 * 1024 * 1024
+        npartitions = max(1, len(df) // (chunk_bytes // df.memory_usage(deep=True).mean()))
         
         return dd.from_pandas(df, npartitions=int(npartitions))
 
@@ -82,7 +86,7 @@ class TFTModel(BaseModel):
             self.logger.log_info(f"Starting TFT preprocessing for dataset of size {len(df):,} rows")
             
             ddf = self._convert_to_dask(df)
-            batch_size = 50000
+            batch_size = 500000
             n_partitions = max(1, len(df) // batch_size)
             ddf = ddf.repartition(npartitions=n_partitions)
             
@@ -155,8 +159,17 @@ class TFTModel(BaseModel):
             
         return train_dataloader, None
         
-    def train(self, train_data, validation_data=None, max_epochs=100):
+    def train(self, train_data: pd.DataFrame, validation_data: Optional[pd.DataFrame] = None, 
+        max_epochs: int = 100) -> Dict:
+        """Train TFT model with GPU acceleration."""
         try:
+            # Check for existing model
+            model_path = os.path.join("Scripts/climate_prediction/outputs/models", "tft_model_latest")
+            if os.path.exists(model_path):
+                self.logger.log_info("Loading existing TFT model")
+                self._load_model_data(model_path)
+                return {}
+                
             training = self.preprocess_data(train_data)
             validation = self.preprocess_data(validation_data) if validation_data is not None else None
             
@@ -209,6 +222,22 @@ class TFTModel(BaseModel):
                 reduction="sum"
             )["attention"]
             
+            # Save model
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            save_path = os.path.join("Scripts/climate_prediction/outputs/models", f"tft_model_{timestamp}")
+            self._save_model_data(save_path)
+            
+            # Create/update latest symlink
+            latest_path = os.path.join("Scripts/climate_prediction/outputs/models", "tft_model_latest")
+            if os.path.exists(latest_path):
+                os.remove(latest_path)
+            os.symlink(save_path, latest_path)
+            
+            return {
+                'feature_importance': self.feature_importance,
+                'training_metrics': trainer.callback_metrics
+            }
+            
         except Exception as e:
             self.logger.log_error(f"Training error: {str(e)}")
             raise
@@ -251,7 +280,7 @@ class TFTModel(BaseModel):
             raise
             
     def _save_model_data(self, path):
-        # Save model parameters and state
+    # Save model parameters and state
         model_data = {
             'max_prediction_length': self.max_prediction_length,
             'max_encoder_length': self.max_encoder_length,
@@ -263,7 +292,7 @@ class TFTModel(BaseModel):
             'training_config': self.training.get_parameters(),
             'feature_importance': self.feature_importance
         }
-        
+
         # Save model state
         torch.save(self.model.state_dict(), f"{path}/tft_model.pth")
         # Save other parameters

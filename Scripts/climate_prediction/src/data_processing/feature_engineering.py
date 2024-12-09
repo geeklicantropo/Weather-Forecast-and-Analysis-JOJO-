@@ -1,4 +1,3 @@
-# src/data_processing/feature_engineering.py
 import pandas as pd
 import numpy as np
 from typing import Dict, List
@@ -40,7 +39,10 @@ class FeatureEngineer:
                         # Process features
                         processed_chunk = self._process_chunk(current_data)
                         
-                        # Save non-overlapping part
+                        # Drop any Unnamed columns
+                        processed_chunk = processed_chunk.loc[:, ~processed_chunk.columns.str.contains('^Unnamed')]
+                        
+                        #Save non-overlapping part
                         if i > 0:  # Not first chunk
                             processed_chunk = processed_chunk.iloc[overlap:]
                         
@@ -72,30 +74,50 @@ class FeatureEngineer:
         # Ensure datetime index
         df.index = pd.to_datetime(df.index)
         
-        # Add basic temporal features
-        df['hour'] = df.index.hour
+        # Add refined temporal features (excluding hour)
         df['day'] = df.index.day
         df['month'] = df.index.month
         df['day_of_week'] = df.index.dayofweek
         
         # Add cyclic encoding for temporal features
-        df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
-        df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
         df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12)
         df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
         
-        # Add essential rolling features (24-hour window only)
+        # More aggressive missing value handling
         if self.temp_col in df.columns:
-            rolling = df[self.temp_col].rolling(window=24, min_periods=1)
-            df['temp_mean_24h'] = rolling.mean()
-            df['temp_std_24h'] = rolling.std()
+            # Fill missing temperatures with seasonal averages
+            df[self.temp_col] = df[self.temp_col].groupby([df.index.month, df.index.day]).transform(
+                lambda x: x.fillna(x.mean())
+            )
+            
+            # Calculate rolling features with proper handling of NaN
+            df['temp_mean_24'] = df[self.temp_col].rolling(
+                window=24, min_periods=1, center=True
+            ).mean()
+            df['temp_std_24'] = df[self.temp_col].rolling(
+                window=24, min_periods=1, center=True
+            ).std()
         
-        # Basic weather features
+        # Enhanced weather features with better NaN handling
         if 'PRECIPITACÃO TOTAL HORÁRIO MM' in df.columns:
-            df['is_raining'] = (df['PRECIPITACÃO TOTAL HORÁRIO MM'] > 0).astype(int)
-        
+            df['is_raining'] = df['PRECIPITACÃO TOTAL HORÁRIO MM'].fillna(0).gt(0).astype(int)
+            
         if 'UMIDADE RELATIVA DO AR HORARIA %' in df.columns:
+            df['UMIDADE RELATIVA DO AR HORARIA %'] = df['UMIDADE RELATIVA DO AR HORARIA %'].fillna(
+                df['UMIDADE RELATIVA DO AR HORARIA %'].mean()
+            )
             df['is_humid'] = (df['UMIDADE RELATIVA DO AR HORARIA %'] > 70).astype(int)
+        
+        # Comprehensive NaN handling
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        
+        # Fill NaN with forward fill, then backward fill, then column mean
+        df[numeric_cols] = df[numeric_cols].fillna(method='ffill', limit=24)
+        df[numeric_cols] = df[numeric_cols].fillna(method='bfill', limit=24)
+        df[numeric_cols] = df[numeric_cols].fillna(df[numeric_cols].mean())
+        
+        # Drop any Unnamed columns
+        df = df.loc[:, ~df.columns.str.contains('^Unnamed')]
         
         return df
         

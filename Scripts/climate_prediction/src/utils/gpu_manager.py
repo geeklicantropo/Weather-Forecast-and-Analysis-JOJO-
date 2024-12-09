@@ -32,13 +32,31 @@ class GPUManager:
         if not self.gpu_available:
             return base_batch_size
             
-        total_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3  # GB
-        if total_memory >= 16:
-            return base_batch_size * 4
-        elif total_memory >= 8:
-            return base_batch_size * 2
+         # Get total and available memory on the GPU
+        device_properties = torch.cuda.get_device_properties(0)
+        total_memory = device_properties.total_memory / 1024**3  # Total memory in GB
+        reserved_memory = torch.cuda.memory_reserved(0) / 1024**3  # Reserved memory in GB
+        allocated_memory = torch.cuda.memory_allocated(0) / 1024**3  # Allocated memory in GB
+        available_memory = total_memory - reserved_memory - allocated_memory  # Free memory in GB
+
+        # Scale batch size based on available memory
+        if total_memory >= 23:
+            if available_memory >= 20:
+                return base_batch_size * 8
+            elif available_memory >= 16:
+                return base_batch_size * 6
+            elif available_memory >= 12:
+                return base_batch_size * 4
+            elif available_memory >= 8:
+                return base_batch_size * 2
+        elif total_memory >= 16:
+            if available_memory >= 12:
+                return base_batch_size * 4
+            elif available_memory >= 8:
+                return base_batch_size * 2
+
         return base_batch_size
-    
+        
     @contextmanager
     def memory_monitor(self):
         """Context manager to monitor GPU memory usage."""
