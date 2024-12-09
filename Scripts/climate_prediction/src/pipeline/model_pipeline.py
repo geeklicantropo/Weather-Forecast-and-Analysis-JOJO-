@@ -9,11 +9,14 @@ import json
 import numpy as np
 import dask.dataframe as dd
 import gc
+from dask.distributed import Client, LocalCluster
+
 
 from ..models.lstm_model import LSTMModel
 from ..models.sarima_model import SARIMAModel
 from ..models.tft_model import TFTModel
 from ..models.model_evaluator import ModelEvaluator
+from src.models.prediction_manager import PredictionManager
 from ..visualization.visualization_manager import VisualizationManager
 from .data_pipeline import DataPipeline
 from ..utils.logger import ProgressLogger
@@ -31,6 +34,7 @@ class ModelPipeline:
         self.visualizer = VisualizationManager(self.logger)
         self.target_variable = self.config['preprocessing']['target_variable']
         self.file_checker = FileChecker()
+        self.prediction_manager = PredictionManager(self.logger)
         
     def load_data(self, train_path: str, test_path: str, 
               chunk_size: int = 500000) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -166,34 +170,14 @@ class ModelPipeline:
         return results
     
     def generate_forecasts(self, models: Dict[str, object], 
-                      train_data: dd.DataFrame) -> Dict[str, pd.DataFrame]:
+                       data: pd.DataFrame) -> Dict[str, pd.DataFrame]:
         """Generate forecasts with uncertainty estimation."""
-        forecasts = {}
-        forecast_horizon = self.config['output']['forecast']['horizon']
-        
         try:
-            for name, model in models.items():
-                self.logger.log_info(f"Generating forecast for {name.upper()} model")
-                
-                try:
-                    # Generate forecast with uncertainty bounds
-                    with gpu_manager.memory_monitor():
-                        forecast = model.predict(train_data, forecast_horizon)
-                        forecasts[name] = forecast
-                    
-                    # Save individual model forecasts
-                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                    save_path = f"{self.output_dir}/forecasts/{name}_forecast_{timestamp}.csv"
-                    forecast.to_csv(save_path)
-                    
-                    # Clear memory after each forecast
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                        
-                except Exception as e:
-                    self.logger.log_error(f"Error generating forecast for {name}: {str(e)}")
-                    continue
+            # Convert data to Dask DataFrame using PredictionManager
+            dask_data = self.prediction_manager.prepare_data_for_prediction(data)
+            
+            # Use PredictionManager to handle forecast generation
+            forecasts = self.prediction_manager.run_distributed_predictions(models, dask_data)
             
             # Generate ensemble forecast if we have multiple models
             if len(forecasts) > 1:
@@ -298,13 +282,26 @@ class ModelPipeline:
             # Generate forecasts
             forecasts = self.generate_forecasts(models, train_data)
             
+            # Compute model agreement
+            agreement_df = self.prediction_manager.compute_model_agreement(forecasts)
+            agreement_df.to_csv(f"{self.output_dir}/model_agreement.csv", index=True)
+            
             return {
                 'status': 'success',
                 'models': models,
                 'evaluation': evaluation_results,
-                'forecasts': forecasts
+                'forecasts': forecasts,
+                'model_agreement': agreement_df
             }
             
         except Exception as e:
             self.logger.log_error(f"Pipeline failed: {str(e)}")
             raise
+
+    def setup_dask_client(self):
+        cluster = LocalCluster(
+            n_workers=8,
+            threads_per_worker=2,
+            memory_limit='4GB'
+        )
+        return Client(cluster)

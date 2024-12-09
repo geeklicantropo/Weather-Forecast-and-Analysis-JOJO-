@@ -5,6 +5,8 @@ import dask.dataframe as dd
 import gc
 import torch
 from ..utils.gpu_manager import gpu_manager
+from tqdm import tqdm
+import psutil
 
 from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet
 from pytorch_forecasting.data import GroupNormalizer, NaNLabelEncoder
@@ -26,8 +28,8 @@ class CustomMetrics:
 
 class TFTModel(BaseModel):
     def __init__(self, target_variable, logger, 
-                max_prediction_length=24*7,  # 7 days ahead
-                max_encoder_length=24*30,    # 30 days history
+                max_prediction_length=24*7,
+                max_encoder_length=24*30,
                 learning_rate=0.001,
                 hidden_size=32,
                 attention_head_size=4,
@@ -43,8 +45,7 @@ class TFTModel(BaseModel):
         self.attention_head_size = attention_head_size
         self.dropout = dropout
         self.hidden_continuous_size = hidden_continuous_size
-        self.loss_fn = loss_fn or CustomMetrics().metrics['quantile']
-        self.metrics = CustomMetrics().metrics
+        self.loss_fn = loss_fn or QuantileLoss()
         
     def _create_features(self, df):
         """Create time-based features"""
@@ -52,7 +53,7 @@ class TFTModel(BaseModel):
         df['time_idx'] = (df.index - df.index.min()).total_seconds() // 3600
         
         # Time features
-        df['hour'] = df.index.hour
+        #df['hour'] = df.index.hour
         df['day'] = df.index.day
         df['month'] = df.index.month
         df['day_of_week'] = df.index.dayofweek
@@ -60,59 +61,62 @@ class TFTModel(BaseModel):
         
         # Special features
         df['is_weekend'] = df['day_of_week'].isin([5, 6]).astype(int)
-        df['hour_of_week'] = df['hour'] + df['day_of_week'] * 24
+        #df['hour_of_week'] = df['hour'] + df['day_of_week'] * 24
         
         return df
         
-    def preprocess_data(self, df: dd.DataFrame):
-        """Prepare data for TFT model with Dask support."""
+    def _convert_to_dask(self, df: pd.DataFrame) -> dd.DataFrame:
+        """Convert pandas DataFrame to Dask DataFrame if not already."""
+        if isinstance(df, dd.DataFrame):
+            return df
+        
+        # Calculate memory usage and optimal chunk size
+        memory_usage = df.memory_usage(deep=True).sum()
+        chunk_bytes = 128 * 1024 * 1024  # 128MB chunks
+        npartitions = max(1, memory_usage // chunk_bytes)
+        
+        return dd.from_pandas(df, npartitions=int(npartitions))
+
+    def preprocess_data(self, df: pd.DataFrame):
         try:
-            # Create necessary features using Dask
-            df = df.copy()
+            self.logger.log_info(f"Starting TFT preprocessing for dataset of size {len(df):,} rows")
             
-            # Create time features using Dask operations
-            df['hour'] = df.index.hour
-            df['day'] = df.index.day
-            df['month'] = df.index.month
-            df['day_of_week'] = df.index.dayofweek
-            df['week'] = df.index.isocalendar().week
+            ddf = self._convert_to_dask(df)
+            batch_size = 50000
+            n_partitions = max(1, len(df) // batch_size)
+            ddf = ddf.repartition(npartitions=n_partitions)
             
-            # Calculate time index
-            min_date = df.index.min().compute()
-            df['time_idx'] = (df.index - min_date).total_seconds() / 3600
-            
-            # Process static features
-            static_features = ['ESTACAO', 'UF', 'LATITUDE', 'LONGITUDE', 'ALTITUDE']
-            
-            # Convert to pandas in controlled chunks
-            chunk_size = gpu_manager.get_optimal_batch_size()
             processed_chunks = []
             
-            for chunk in df.map_partitions(pd.DataFrame).compute_chunk_sizes():
-                chunk_data = chunk.compute()
-                processed_chunks.append(chunk_data)
-                
-                # Clear memory after each chunk
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+            with tqdm(total=ddf.npartitions, desc="Processing TFT batches") as pbar:
+                for chunk_df in ddf.partitions:
+                    chunk = chunk_df.compute()
+                    chunk = chunk.copy()
+                    
+                    chunk['time_idx'] = (chunk.index - chunk.index.min()).total_seconds() / 3600
+                    chunk['day'] = chunk.index.day
+                    chunk['month'] = chunk.index.month
+                    chunk['day_of_week'] = chunk.index.dayofweek
+                    chunk['week'] = chunk.index.isocalendar().week
+                    
+                    processed_chunks.append(chunk)
+                    pbar.update(1)
+                    gc.collect()
             
-            # Combine processed chunks
-            processed_df = pd.concat(processed_chunks)
+            df_processed = pd.concat(processed_chunks)
             
-            # Create TimeSeriesDataSet
             training = TimeSeriesDataSet(
-                processed_df,
+                df_processed,
                 time_idx="time_idx",
                 target=self.target_variable,
                 group_ids=["ESTACAO"],
                 min_encoder_length=self.max_encoder_length // 2,
                 max_encoder_length=self.max_encoder_length,
                 min_prediction_length=1,
-                max_prediction_length=self.forecast_horizon,
+                max_prediction_length=self.max_prediction_length,
                 static_categoricals=["ESTACAO", "UF"],
                 static_reals=["LATITUDE", "LONGITUDE", "ALTITUDE"],
-                time_varying_known_categoricals=["hour", "day", "month", "day_of_week"],
+                time_varying_known_categoricals=["day", "month", "day_of_week"],
                 time_varying_known_reals=["time_idx"],
                 time_varying_unknown_reals=[
                     self.target_variable,
@@ -122,8 +126,7 @@ class TFTModel(BaseModel):
                     "VENTO VELOCIDADE HORARIA M/S"
                 ],
                 target_normalizer=GroupNormalizer(
-                    groups=["ESTACAO"],
-                    transformation="softplus"
+                    groups=["ESTACAO"], transformation="softplus"
                 )
             )
             

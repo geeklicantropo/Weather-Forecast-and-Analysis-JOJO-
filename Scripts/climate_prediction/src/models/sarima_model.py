@@ -14,6 +14,9 @@ import gc
 import torch
 from ..utils.gpu_manager import gpu_manager
 
+from tqdm import tqdm
+import psutil
+
 class SARIMAModel(BaseModel):
     def __init__(self, target_variable, logger, order_ranges=None, seasonal_order_ranges=None):
         super().__init__(target_variable, logger)
@@ -26,48 +29,52 @@ class SARIMAModel(BaseModel):
             'P': range(0, 2),
             'D': range(0, 2),
             'Q': range(0, 2),
-            'S': [12, 24]  # 12 for yearly, 24 for daily seasonality
+            'S': [12, 24]
         }
         self.best_params = None
         self.decomposition = None
         
-    def preprocess_data(self, df: dd.DataFrame):
-        """Prepare data for SARIMA model with Dask support."""
+    def _convert_to_dask(self, df: pd.DataFrame) -> dd.DataFrame:
+        """Convert pandas DataFrame to Dask DataFrame if not already."""
+        if isinstance(df, dd.DataFrame):
+            return df
+        
+        # Calculate memory usage and optimal chunk size
+        memory_usage = df.memory_usage(deep=True).sum()
+        chunk_bytes = 128 * 1024 * 1024  # 128MB chunks
+        npartitions = max(1, memory_usage // chunk_bytes)
+        
+        return dd.from_pandas(df, npartitions=int(npartitions))
+    
+    def preprocess_data(self, df: pd.DataFrame) -> pd.Series:
         try:
-            # Get target variable and compute in chunks
-            target_series = df[self.target_variable]
+            self.logger.log_info(f"Starting SARIMA preprocessing for dataset of size {len(df):,} rows")
             
-            # Process data in chunks to avoid memory issues
-            chunk_size = 10000  # Smaller chunks for time series analysis
+            ddf = self._convert_to_dask(df)
+            batch_size = 50000
+            n_partitions = max(1, len(df) // batch_size)
+            ddf = ddf.repartition(npartitions=n_partitions)
+            
             processed_chunks = []
             
-            for chunk in target_series.map_partitions(pd.Series).compute_chunk_sizes():
-                chunk_data = chunk.compute()
-                # Ensure datetime index
-                if not isinstance(chunk_data.index, pd.DatetimeIndex):
-                    chunk_data.index = pd.to_datetime(chunk_data.index)
-                processed_chunks.append(chunk_data)
+            with tqdm(total=ddf.npartitions, desc="Processing SARIMA batches") as pbar:
+                for chunk_df in ddf.partitions:
+                    chunk = chunk_df.compute()
+                    chunk_series = chunk[self.target_variable]
+                    
+                    if not isinstance(chunk_series.index, pd.DatetimeIndex):
+                        chunk_series.index = pd.to_datetime(chunk_series.index)
+                    
+                    chunk_series = chunk_series.resample('H').mean()
+                    chunk_series = chunk_series.fillna(method='ffill', limit=6)
+                    chunk_series = chunk_series.fillna(method='bfill', limit=6)
+                    
+                    processed_chunks.append(chunk_series)
+                    pbar.update(1)
+                    gc.collect()
             
-            # Combine processed chunks
-            target_series = pd.concat(processed_chunks)
-            target_series = target_series.sort_index()
-            
-            # Resample to ensure regular time intervals
-            target_series = target_series.resample('H').mean()
-            
-            # Handle missing values
-            target_series = target_series.fillna(method='ffill', limit=6)
-            target_series = target_series.fillna(method='bfill', limit=6)
-            
-            # Store seasonal decomposition
-            if len(target_series) >= 24:  # Ensure enough data for decomposition
-                self.decomposition = seasonal_decompose(
-                    target_series,
-                    period=24,  # 24 hours seasonality
-                    extrapolate_trend='freq'
-                )
-            
-            return target_series
+            final_series = pd.concat(processed_chunks)
+            return final_series.sort_index()
             
         except Exception as e:
             self.logger.error(f"Error in SARIMA preprocessing: {str(e)}")

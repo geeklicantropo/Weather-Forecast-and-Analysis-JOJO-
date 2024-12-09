@@ -1,3 +1,4 @@
+#src/models/lstm_model.py
 import numpy as np
 import torch
 import torch.nn as nn
@@ -6,10 +7,14 @@ from sklearn.preprocessing import MinMaxScaler
 import joblib
 import pandas as pd
 import dask.dataframe as dd
+import dask.array as da
+from dask.delayed import delayed
 import gc
 from datetime import datetime
 from typing import Dict, Optional, Tuple, Any
 import os
+import psutil
+from tqdm import tqdm
 
 from .base_model import BaseModel
 from ..utils.gpu_manager import gpu_manager
@@ -74,46 +79,70 @@ class LSTMModel(BaseModel):
         self.batch_size = gpu_manager.get_optimal_batch_size()
         self.feature_names = []
         
-    def preprocess_data(self, df: dd.DataFrame) -> TensorDataset:
-        """Prepare data for LSTM model with Dask support."""
+    def _convert_to_dask(self, df: pd.DataFrame) -> dd.DataFrame:
+        """Convert pandas DataFrame to Dask DataFrame if not already."""
+        if isinstance(df, dd.DataFrame):
+            return df
+        
+        # Calculate memory usage and optimal chunk size
+        memory_usage = df.memory_usage(deep=True).sum()
+        chunk_bytes = 128 * 1024 * 1024  # 128MB chunks
+        npartitions = max(1, memory_usage // chunk_bytes)
+        
+        return dd.from_pandas(df, npartitions=int(npartitions))
+    
+    def preprocess_data(self, df: pd.DataFrame) -> TensorDataset:
         try:
-            # Create sequence data with rolling windows
-            features = df.select_dtypes(include=[np.number])
+            self.logger.log_info(f"Starting LSTM preprocessing for dataset of size {len(df):,} rows")
+            
+            # Convert to Dask DataFrame
+            ddf = self._convert_to_dask(df)
+            features = ddf.select_dtypes(include=[np.number])
             self.feature_names = features.columns.tolist()
             
-            # Convert Dask DataFrame to numpy in chunks for scaling
-            chunk_size = gpu_manager.get_optimal_batch_size()
-            scaled_data = []
+            # Repartition for optimal batch size
+            batch_size = 10000
+            n_partitions = max(1, len(df) // batch_size)
+            features = features.repartition(npartitions=n_partitions)
             
-            for chunk in features.map_partitions(pd.DataFrame.to_numpy).compute_chunk_sizes():
-                chunk_data = chunk.compute()
-                # Fit scaler only on first chunk
-                if not scaled_data:
-                    self.scaler = self.scaler.fit(chunk_data)
-                scaled_chunk = self.scaler.transform(chunk_data)
-                scaled_data.append(scaled_chunk)
-                
-                # Clear memory
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            
-            # Combine scaled chunks
-            scaled_data = np.vstack(scaled_data)
-            
-            # Create sequences
+            all_X, all_y = [], []
             X, y = [], []
-            for i in range(len(scaled_data) - self.sequence_length - self.forecast_horizon + 1):
-                X.append(scaled_data[i:(i + self.sequence_length)])
-                y.append(scaled_data[
-                    (i + self.sequence_length):(i + self.sequence_length + self.forecast_horizon),
-                    features.columns.get_loc(self.target_variable)
-                ])
+            total_sequences = 0
             
-            X = torch.FloatTensor(np.array(X)).to(self.device)
-            y = torch.FloatTensor(np.array(y)).to(self.device)
+            with tqdm(total=features.npartitions, desc="Processing LSTM batches") as pbar:
+                for i, chunk_df in enumerate(features.partitions):
+                    chunk_data = chunk_df.compute()
+                    
+                    if len(chunk_data) <= self.sequence_length:
+                        continue
+                    
+                    scaled_chunk = self.scaler.fit_transform(chunk_data)
+                    
+                    for j in range(len(scaled_chunk) - self.sequence_length - self.forecast_horizon + 1):
+                        X.append(scaled_chunk[j:(j + self.sequence_length)])
+                        y.append(scaled_chunk[
+                            (j + self.sequence_length):(j + self.sequence_length + self.forecast_horizon),
+                            self.feature_names.index(self.target_variable)
+                        ])
+                        
+                        if len(X) >= batch_size:
+                            all_X.append(torch.FloatTensor(np.array(X, dtype=np.float32)).to(self.device))
+                            all_y.append(torch.FloatTensor(np.array(y, dtype=np.float32)).to(self.device))
+                            total_sequences += len(X)
+                            X, y = [], []
+                    
+                    pbar.update(1)
+                    gc.collect()
             
-            return TensorDataset(X, y)
+            if X:
+                all_X.append(torch.FloatTensor(np.array(X, dtype=np.float32)).to(self.device))
+                all_y.append(torch.FloatTensor(np.array(y, dtype=np.float32)).to(self.device))
+                total_sequences += len(X)
+            
+            X_tensor = torch.cat(all_X)
+            y_tensor = torch.cat(all_y)
+            
+            return TensorDataset(X_tensor, y_tensor)
             
         except Exception as e:
             self.logger.error(f"Error in LSTM preprocessing: {str(e)}")
@@ -121,7 +150,7 @@ class LSTMModel(BaseModel):
     
     def train(self, train_data: dd.DataFrame, validation_data: Optional[dd.DataFrame] = None, 
              epochs: int = 50) -> Dict:
-        """Train LSTM model with processed data."""
+        """Train LSTM model with processed Dask data."""
         try:
             # Process data first
             processed_train = self.preprocess_data(train_data)
@@ -168,7 +197,6 @@ class LSTMModel(BaseModel):
                     loss = criterion(outputs, y_batch)
                     loss.backward()
                     
-                    # Gradient clipping
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                     
                     optimizer.step()
@@ -177,7 +205,6 @@ class LSTMModel(BaseModel):
                 avg_train_loss = train_loss / len(train_loader)
                 training_history['train_loss'].append(avg_train_loss)
                 
-                # Validation phase
                 if processed_val is not None:
                     val_loss = self._validate(processed_val, criterion)
                     training_history['val_loss'].append(val_loss)
@@ -195,12 +222,6 @@ class LSTMModel(BaseModel):
                         self.logger.log_info(f"Early stopping at epoch {epoch}")
                         self._load_best_model()
                         break
-                    
-                    self.logger.log_info(
-                        f"Epoch {epoch}: Train Loss = {avg_train_loss:.4f}, Val Loss = {val_loss:.4f}"
-                    )
-                else:
-                    self.logger.log_info(f"Epoch {epoch}: Train Loss = {avg_train_loss:.4f}")
             
             return training_history
             
@@ -226,54 +247,56 @@ class LSTMModel(BaseModel):
         return val_loss / len(val_loader)
     
     def predict(self, data: dd.DataFrame, forecast_horizon: Optional[int] = None) -> pd.DataFrame:
-        """Generate predictions with uncertainty estimation."""
+        """Generate predictions with uncertainty estimation using Dask."""
         self.model.eval()
         forecast_horizon = forecast_horizon or self.forecast_horizon
         
-        # Process input data
-        dataset = self.preprocess_data(data)
-        dataloader = DataLoader(dataset, batch_size=self.batch_size, pin_memory=True)
-        
-        predictions = []
-        prediction_intervals = []
-        
-        with torch.no_grad():
-            for X_batch, _ in dataloader:
-                # Monte Carlo Dropout for uncertainty estimation
-                mc_predictions = []
-                self.model.train()  # Enable dropout
-                
-                for _ in range(100):  # Number of Monte Carlo samples
-                    output, _ = self.model(X_batch)
-                    mc_predictions.append(output.cpu().numpy())
-                
-                mc_predictions = np.array(mc_predictions)
-                mean_prediction = np.mean(mc_predictions, axis=0)
-                std_prediction = np.std(mc_predictions, axis=0)
-                
-                predictions.append(mean_prediction)
-                prediction_intervals.append([
-                    mean_prediction - 1.96 * std_prediction,  # Lower bound (95% CI)
-                    mean_prediction + 1.96 * std_prediction   # Upper bound (95% CI)
-                ])
-        
-        # Combine predictions
-        predictions = np.vstack(predictions)
-        prediction_intervals = np.array(prediction_intervals)
-        
-        # Create DataFrame with dates
-        dates = pd.date_range(
-            start=data.index[-1],
-            periods=len(predictions) * self.forecast_horizon,
-            freq='H'
-        )
-        
-        results = pd.DataFrame(index=dates)
-        results['forecast'] = self._inverse_transform(predictions.flatten())
-        results['lower_bound'] = self._inverse_transform(prediction_intervals[:, :, 0].flatten())
-        results['upper_bound'] = self._inverse_transform(prediction_intervals[:, :, 1].flatten())
-        
-        return results
+        try:
+            # Process data in parallel using Dask
+            dataset = self.preprocess_data(data)
+            dataloader = DataLoader(dataset, batch_size=self.batch_size, pin_memory=True)
+            
+            predictions = []
+            prediction_intervals = []
+            
+            with torch.no_grad():
+                for X_batch, _ in dataloader:
+                    mc_predictions = []
+                    self.model.train()
+                    
+                    for _ in range(100):
+                        output, _ = self.model(X_batch)
+                        mc_predictions.append(output.cpu().numpy())
+                    
+                    mc_predictions = np.array(mc_predictions)
+                    mean_prediction = np.mean(mc_predictions, axis=0)
+                    std_prediction = np.std(mc_predictions, axis=0)
+                    
+                    predictions.append(mean_prediction)
+                    prediction_intervals.append([
+                        mean_prediction - 1.96 * std_prediction,
+                        mean_prediction + 1.96 * std_prediction
+                    ])
+            
+            predictions = np.vstack(predictions)
+            prediction_intervals = np.array(prediction_intervals)
+            
+            dates = pd.date_range(
+                start=data.index.compute()[-1],
+                periods=len(predictions) * self.forecast_horizon,
+                freq='H'
+            )
+            
+            results = pd.DataFrame(index=dates)
+            results['forecast'] = self._inverse_transform(predictions.flatten())
+            results['lower_bound'] = self._inverse_transform(prediction_intervals[:, :, 0].flatten())
+            results['upper_bound'] = self._inverse_transform(prediction_intervals[:, :, 1].flatten())
+            
+            return results
+            
+        except Exception as e:
+            self.logger.log_error(f"Prediction error: {str(e)}")
+            raise
     
     def _inverse_transform(self, data: np.ndarray) -> np.ndarray:
         """Inverse transform scaled data."""
@@ -317,6 +340,7 @@ class LSTMModel(BaseModel):
         self.feature_names = checkpoint['feature_names']
         self.best_state = checkpoint['best_state']
         
+
         input_size = len(self.feature_names)
         self.model = LSTMNet(
             input_size,
