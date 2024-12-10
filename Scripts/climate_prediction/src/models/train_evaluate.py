@@ -7,6 +7,13 @@ import numpy as np
 from datetime import datetime
 import logging
 from typing import Dict, List, Tuple
+import torch
+import gc
+
+# Defer dask imports to runtime
+def get_dask():
+    import dask.dataframe as dd
+    return dd
 
 from src.models.lstm_model import LSTMModel
 from src.models.sarima_model import SARIMAModel
@@ -38,22 +45,45 @@ class ModelTrainEvaluate:
             os.makedirs(directory, exist_ok=True)
     
     def prepare_data(self, data: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        """Split data into train, validation, and test sets."""
+        """Split data into train, validation, and test sets with memory optimization."""
         data = data.sort_index()
+        gc.collect()  # Force garbage collection
         
-        # Calculate split points based on config
+        # Calculate split points
         total_samples = len(data)
         train_size = int(total_samples * 0.7)
         val_size = int(total_samples * 0.15)
         
-        # Split data
-        train_data = data[:train_size]
-        val_data = data[train_size:train_size + val_size]
-        test_data = data[train_size + val_size:]
+        # Split data in chunks to avoid memory issues
+        chunk_size = min(100000, len(data) // 10)  # Split into at least 10 chunks
+        
+        train_chunks = []
+        val_chunks = []
+        test_chunks = []
+        
+        for i in range(0, len(data), chunk_size):
+            chunk = data.iloc[i:i + chunk_size]
+            if i < train_size:
+                train_chunks.append(chunk)
+            elif i < train_size + val_size:
+                val_chunks.append(chunk)
+            else:
+                test_chunks.append(chunk)
+            
+            # Clear memory after each chunk
+            del chunk
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
+        train_data = pd.concat(train_chunks)
+        val_data = pd.concat(val_chunks)
+        test_data = pd.concat(test_chunks)
         
         self.logger.log_info(f"Data split - Train: {len(train_data)}, Val: {len(val_data)}, Test: {len(test_data)}")
         return train_data, val_data, test_data
     
+    # src/models/train_evaluate.py
     def train_models(self, train_data: pd.DataFrame, val_data: pd.DataFrame) -> Dict:
         """Train all models with GPU support and memory optimization."""
         models = {}
@@ -64,9 +94,10 @@ class ModelTrainEvaluate:
             batch_size = gpu_manager.get_optimal_batch_size()
             memory_info = gpu_manager.get_memory_info()
             
+            # Modified order - SARIMA first
             model_configs = {
-                'lstm': (LSTMModel, {'batch_size': batch_size}),
                 'sarima': (SARIMAModel, {}),
+                'lstm': (LSTMModel, {'batch_size': batch_size}),
                 'tft': (TFTModel, {'batch_size': batch_size})
             }
             
@@ -86,22 +117,33 @@ class ModelTrainEvaluate:
                         if self.device.type == 'cuda':
                             gpu_manager.clear_memory()
                         
-                        # Train model
+                        # Train model with memory monitoring
                         with gpu_manager.memory_monitor():
                             history = model.train(train_data, val_data)
                             models[name] = model
                             training_histories[name] = history
                         
                         # Save model checkpoint
-                        model_path = f"Scripts/climate_prediction/outputs/models/{name}_model_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                        model_path = f"Scripts/climate_prediction/outputs/models/{name}_model_{timestamp}"
                         model.save_model(model_path)
+                        
+                        # Generate and save predictions
+                        predictions = model.predict(val_data)
+                        pred_path = f"Scripts/climate_prediction/outputs/predictions/{name}_predictions_{timestamp}.csv"
+                        predictions.to_csv(pred_path)
+                        
+                        # Update progress and cleanup
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        gc.collect()
                         
                     except Exception as e:
                         self.logger.log_error(f"Error training {name} model: {str(e)}")
                         continue
-            
-            return models, training_histories
-            
+                
+                return models, training_histories
+                
         except Exception as e:
             self.logger.log_error(f"Model training failed: {str(e)}")
             raise

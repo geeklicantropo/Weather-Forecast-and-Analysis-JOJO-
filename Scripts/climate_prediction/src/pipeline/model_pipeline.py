@@ -11,7 +11,7 @@ import dask.dataframe as dd
 import gc
 from dask.distributed import Client, LocalCluster
 from tqdm import tqdm
-
+from pathlib import Path
 
 from ..models.lstm_model import LSTMModel
 from ..models.sarima_model import SARIMAModel
@@ -36,29 +36,32 @@ class ModelPipeline:
         self.target_variable = self.config['preprocessing']['target_variable']
         self.file_checker = FileChecker()
         self.prediction_manager = PredictionManager(self.logger)
-        
+
+    def _get_chunk_path(self, model_name: str) -> Path:
+        """Get appropriate chunk path based on model type."""
+        base_path = Path("Scripts/climate_prediction/outputs/data/temp")
+        chunk_paths = {
+            'lstm': base_path / 'sequence_chunks',
+            'sarima': base_path / 'sarima_chunks',
+            'tft': base_path / 'tft_chunks'
+        }
+        return chunk_paths[model_name]
+
     def load_data(self, train_path: str, test_path: str, chunk_size: int = 100000) -> Tuple[dd.DataFrame, dd.DataFrame]:
-        """Load processed data with memory optimization."""
+        """Load processed data with proper chunk management."""
         if not os.path.exists(train_path) or not os.path.exists(test_path):
-            self.logger.log_error("Required data files not found")
             raise FileNotFoundError("Missing required data files")
 
         try:
-            # Calculate total size and available memory
-            total_size = os.path.getsize(train_path) + os.path.getsize(test_path)
-            available_memory = psutil.virtual_memory().available
-            gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3 if torch.cuda.is_available() else 0
-            
-            # Use the smaller of available system memory or GPU memory
-            target_memory = min(available_memory, gpu_memory * 1024**3 if gpu_memory else float('inf'))
+            self.logger.log_info("Starting data loading process")
             
             # Calculate optimal chunk size
-            optimal_chunk_size = int((target_memory * 0.1) / (2 * 1024))  # 10% of memory per chunk
-            chunk_size = max(1000, min(optimal_chunk_size, chunk_size))
+            available_memory = psutil.virtual_memory().available
+            gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3 if torch.cuda.is_available() else 0
+            target_memory = min(available_memory, gpu_memory * 1024**3 if gpu_memory else float('inf'))
+            chunk_size = max(1000, min(int((target_memory * 0.1) / (2 * 1024)), chunk_size))
             
-            self.logger.log_info(f"Loading data with chunk size: {chunk_size}")
-            
-            # Define optimized dtypes
+            # Initialize chunk tracking
             dtypes = {
                 'PRECIPITACÃO TOTAL HORÁRIO MM': 'float32',
                 'PRESSAO ATMOSFERICA AO NIVEL DA ESTACAO HORARIA MB': 'float32',
@@ -70,53 +73,92 @@ class ModelPipeline:
                 'ALTITUDE': 'float32'
             }
 
-            # Load in chunks with memory monitoring
-            train_chunks = []
-            test_chunks = []
-            
-            # Load train data
+            # Create chunk directories for each model type
+            for model_type in ['lstm', 'sarima', 'tft']:
+                chunk_dir = self._get_chunk_path(model_type)
+                chunk_dir.mkdir(parents=True, exist_ok=True)
+
+            # Process train data
             self.logger.log_info("Loading train data...")
-            for chunk in pd.read_csv(train_path, compression='gzip', chunksize=chunk_size, dtype=dtypes):
-                if 'DATETIME' in chunk.columns:
-                    chunk['DATETIME'] = pd.to_datetime(chunk['DATETIME'])
-                    chunk.set_index('DATETIME', inplace=True)
-                else:
-                    chunk['DATETIME'] = pd.to_datetime(chunk['DATA YYYY-MM-DD'])
-                    chunk.set_index('DATETIME', inplace=True)
-                train_chunks.append(chunk)
-                
-                if psutil.virtual_memory().percent > 80:
-                    self.logger.log_warning("Memory usage high, concatenating chunks")
-                    train_chunks = [dd.concat(train_chunks)]
-                    gc.collect()
+            train_size = sum(1 for _ in pd.read_csv(train_path, chunksize=chunk_size))
+            train_chunks = {model_type: [] for model_type in ['lstm', 'sarima', 'tft']}
             
-            # Concatenate train chunks into a single Dask DataFrame
-            train_data = dd.concat(train_chunks)
-            
-            # Load test data
-            self.logger.log_info("Loading test data...")
-            for chunk in pd.read_csv(test_path, compression='gzip', chunksize=chunk_size, dtype=dtypes):
-                if 'DATETIME' in chunk.columns:
-                    chunk['DATETIME'] = pd.to_datetime(chunk['DATETIME'])
-                    chunk.set_index('DATETIME', inplace=True)
-                else:
-                    chunk['DATETIME'] = pd.to_datetime(chunk['DATA YYYY-MM-DD'])
-                    chunk.set_index('DATETIME', inplace=True)
-                test_chunks.append(chunk)
-                
-                if psutil.virtual_memory().percent > 80:
-                    self.logger.log_warning("Memory usage high, concatenating chunks")
-                    test_chunks = [dd.concat(test_chunks)]
+            with tqdm(total=train_size, desc="Processing train chunks") as pbar:
+                for chunk_idx, chunk in enumerate(pd.read_csv(train_path, chunksize=chunk_size, dtype=dtypes)):
+                    # Handle datetime index
+                    if 'DATETIME' in chunk.columns:
+                        chunk['DATETIME'] = pd.to_datetime(chunk['DATETIME'])
+                        chunk.set_index('DATETIME', inplace=True)
+                    else:
+                        chunk['DATETIME'] = pd.to_datetime(chunk['DATA YYYY-MM-DD'])
+                        chunk.set_index('DATETIME', inplace=True)
+                    
+                    # Save chunks for each model type
+                    for model_type in ['lstm', 'sarima', 'tft']:
+                        chunk_dir = self._get_chunk_path(model_type)
+                        chunk_path = chunk_dir / f'chunk_{chunk_idx:04d}.parquet'
+                        
+                        if not chunk_path.exists():
+                            chunk.to_parquet(chunk_path)
+                        train_chunks[model_type].append(chunk_path)
+                    
+                    pbar.update(1)
+                    
+                    # Clear memory periodically
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                     gc.collect()
 
-            # Concatenate test chunks into a single Dask DataFrame
-            test_data = dd.concat(test_chunks)
+            # Process test data
+            self.logger.log_info("Loading test data...")
+            test_size = sum(1 for _ in pd.read_csv(test_path, chunksize=chunk_size))
+            test_chunks = {model_type: [] for model_type in ['lstm', 'sarima', 'tft']}
             
-            self.logger.log_info(f"Loaded train data: {len(train_data)} rows")
-            self.logger.log_info(f"Loaded test data: {len(test_data)} rows")
+            with tqdm(total=test_size, desc="Processing test chunks") as pbar:
+                for chunk_idx, chunk in enumerate(pd.read_csv(test_path, chunksize=chunk_size, dtype=dtypes)):
+                    if 'DATETIME' in chunk.columns:
+                        chunk['DATETIME'] = pd.to_datetime(chunk['DATETIME'])
+                        chunk.set_index('DATETIME', inplace=True)
+                    else:
+                        chunk['DATETIME'] = pd.to_datetime(chunk['DATA YYYY-MM-DD'])
+                        chunk.set_index('DATETIME', inplace=True)
+                    
+                    # Save chunks for each model type
+                    for model_type in ['lstm', 'sarima', 'tft']:
+                        chunk_dir = self._get_chunk_path(model_type)
+                        chunk_path = chunk_dir / f'test_chunk_{chunk_idx:04d}.parquet'
+                        
+                        if not chunk_path.exists():
+                            chunk.to_parquet(chunk_path)
+                        test_chunks[model_type].append(chunk_path)
+                    
+                    pbar.update(1)
+                    
+                    # Clear memory periodically
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    gc.collect()
+
+            # Load data based on current model type
+            current_model = self.current_model_type if hasattr(self, 'current_model_type') else 'lstm'
             
+            # Load train data for current model
+            train_data = dd.read_parquet(
+                train_chunks[current_model],
+                engine='pyarrow'
+            ).repartition(npartitions=max(1, len(train_chunks[current_model])))
+
+            # Load test data for current model
+            test_data = dd.read_parquet(
+                test_chunks[current_model],
+                engine='pyarrow'
+            ).repartition(npartitions=max(1, len(test_chunks[current_model])))
+
+            self.logger.log_info(f"Loaded {current_model.upper()} train data: {len(train_data)} rows")
+            self.logger.log_info(f"Loaded {current_model.upper()} test data: {len(test_data)} rows")
+
             return train_data, test_data
-            
+
         except Exception as e:
             self.logger.log_error(f"Error loading data: {str(e)}")
             raise
@@ -143,72 +185,93 @@ class ModelPipeline:
         return False
 
     def train_models(self, train_data: pd.DataFrame, test_data: pd.DataFrame) -> Dict[str, object]:
-        """Train models with provided data."""
+        """Train models strictly sequentially with comprehensive tracking."""
         if not self.file_checker.check_final_exists():
             raise ValueError("Final processed data files not found")
 
         models = {}
-        model_classes = {
-            'lstm': LSTMModel,
-            'sarima': SARIMAModel,
-            'tft': TFTModel
-        }
         
-        with tqdm(total=len(model_classes), desc="Training models") as pbar:
-            for name, model_class in model_classes.items():
-                self.logger.log_info(f"Training {name.upper()} model")
-                
-                # Check if model already exists
-                model_path = f"Scripts/climate_prediction/outputs/models/{name}_model_latest"
-                if os.path.exists(model_path):
-                    self.logger.log_info(f"Loading existing {name} model")
-                    model = model_class(self.target_variable, self.logger)
-                    model.load_model(model_path)
-                    models[name] = model
-                    pbar.update(1)
-                    continue
+        # Sequential model order
+        model_sequence = [
+            ('sarima', SARIMAModel),
+            ('lstm', LSTMModel),
+            ('tft', TFTModel)
+        ]
+        
+        with tqdm(total=len(model_sequence), desc="Training models") as pbar:
+            for name, model_class in model_sequence:
+                self.logger.log_info(f"\n{'='*20} Processing {name.upper()} Model {'='*20}")
                 
                 try:
-                    model = model_class(self.target_variable, self.logger)
-                    
-                    # Process data for model with progress tracking
-                    with tqdm(total=2, desc=f"Processing {name} data", leave=False) as proc_pbar:
+                    # 1. Data Processing Stage
+                    with tqdm(total=3, desc=f"{name} pipeline stages") as stage_pbar:
+                        self.logger.log_info(f"Starting {name} data processing")
+                        
+                        model = model_class(self.target_variable, self.logger)
                         processed_train = model.preprocess_data(train_data)
-                        proc_pbar.update(1)
                         processed_test = model.preprocess_data(test_data)
-                        proc_pbar.update(1)
-                    
-                    # Train with progress tracking
-                    with tqdm(total=self.config['training']['epochs'], 
-                            desc=f"{name} epochs", leave=False) as epoch_pbar:
-                        def update_progress(epoch, metrics):
-                            epoch_pbar.update(1)
-                            epoch_pbar.set_postfix(metrics)
-                        model.train(processed_train, processed_test, 
-                                progress_callback=update_progress)
-                    
-                    models[name] = model
-                    
-                    # Save model with proper symlink handling
-                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                    save_path = f"Scripts/climate_prediction/outputs/models/{name}_model_{timestamp}"
-                    model.save_model(save_path)
-                    
-                    # Update symlink safely
-                    if os.path.exists(model_path):
-                        if os.path.islink(model_path):
+                        stage_pbar.update(1)
+                        
+                        # 2. Training Stage
+                        self.logger.log_info(f"Training {name} model")
+                        history = model.train(processed_train, processed_test)
+                        stage_pbar.update(1)
+                        
+                        # 3. Evaluation and Results Stage
+                        self.logger.log_info(f"Generating {name} results and visualizations")
+                        
+                        # Generate predictions
+                        predictions = model.predict(test_data)
+                        evaluator = ModelEvaluator(self.logger)
+                        metrics = evaluator.evaluate_model(model, test_data, predictions)
+                        
+                        # Save all results
+                        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                        
+                        # Save predictions
+                        predictions.to_csv(f"Scripts/climate_prediction/outputs/predictions/{name}_predictions_{timestamp}.csv")
+                        
+                        # Save metrics
+                        pd.DataFrame([metrics]).to_json(
+                            f"Scripts/climate_prediction/outputs/metrics/{name}_metrics_{timestamp}.json"
+                        )
+                        
+                        # Generate visualizations
+                        self.visualizer.plot_predictions(
+                            test_data[self.target_variable], 
+                            {name: predictions}
+                        )
+                        
+                        # Save model
+                        save_path = f"Scripts/climate_prediction/outputs/models/{name}_model_{timestamp}"
+                        model.save_model(save_path)
+                        
+                        # Update model symlink
+                        model_path = f"Scripts/climate_prediction/outputs/models/{name}_model_latest"
+                        if os.path.exists(model_path) and os.path.islink(model_path):
                             os.remove(model_path)
-                    os.symlink(save_path, model_path)
-                    
+                        os.symlink(save_path, model_path)
+                        
+                        stage_pbar.update(1)
+                        
+                        # Store model
+                        models[name] = model
+                        
+                        # Clear memory before next model
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        gc.collect()
+                        
+                        self.logger.log_info(f"\n{'='*20} Completed {name.upper()} Model {'='*20}\n")
+                        
                 except Exception as e:
-                    self.logger.log_error(f"Error training {name} model: {str(e)}")
-                    raise  # Stop execution if any model fails
+                    self.logger.log_error(f"Error processing {name} model: {str(e)}")
+                    continue
                     
-                pbar.update(1)
-                
-                # Clear GPU memory after each model
+                # Ensure complete synchronization before next model
                 if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                pbar.update(1)
         
         return models
         
