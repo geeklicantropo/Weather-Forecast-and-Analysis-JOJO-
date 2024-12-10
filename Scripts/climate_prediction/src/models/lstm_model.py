@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset, Dataset
+from torch.utils.data import DataLoader, TensorDataset, Dataset, IterableDataset
 from sklearn.preprocessing import MinMaxScaler
 import joblib
 import pandas as pd
@@ -10,13 +10,15 @@ import dask.array as da
 from dask.delayed import delayed
 import gc
 from datetime import datetime
-from typing import Dict, Optional, Tuple, Any, Union
+from typing import Dict, Optional, Tuple, Any, Union, List
 import os
+from pathlib import Path
 import psutil
 from tqdm import tqdm
 
 from .base_model import BaseModel
 from ..utils.gpu_manager import gpu_manager
+from ..data_processing.sequence_dataset import SequenceDataset
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -78,6 +80,8 @@ class LSTMModel(BaseModel):
         self.device = self._initialize_device()
         self.batch_size = batch_size
         self.feature_names = []
+        self.temp_files = []
+        self.model_artifacts = []
         
         self.config = {
             'gpu': {
@@ -114,39 +118,48 @@ class LSTMModel(BaseModel):
         
         return dd.from_pandas(df, npartitions=int(npartitions))
     
-    def preprocess_data(self, df: Union[pd.DataFrame, TensorDataset]) -> TensorDataset:
-        if isinstance(df, TensorDataset):
+    def preprocess_data(self, df: Union[pd.DataFrame, TensorDataset, SequenceDataset]) -> Union[TensorDataset, SequenceDataset]:
+        """Preprocess data for LSTM model."""
+        if isinstance(df, (TensorDataset, SequenceDataset)):
             return df
+            
+        if df is None:
+            return None
             
         try:
             self.logger.log_info(f"Starting LSTM preprocessing for dataset of size {len(df):,} rows")
-            temp_dir = "Scripts/climate_prediction/outputs/data/temp"
-            os.makedirs(temp_dir, exist_ok=True)
+            temp_dir = Path("Scripts/climate_prediction/outputs/data/temp")
+            temp_dir.mkdir(parents=True, exist_ok=True)
             
-            # Convert to Dask DataFrame
-            ddf = self._convert_to_dask(df)
+            # Convert to Dask DataFrame if needed
+            if isinstance(df, pd.DataFrame):
+                memory_usage = df.memory_usage(deep=True).sum()
+                chunk_bytes = 128 * 1024 * 1024
+                npartitions = max(1, memory_usage // chunk_bytes)
+                ddf = dd.from_pandas(df, npartitions=int(npartitions))
+            else:
+                ddf = df
 
             features = ddf.select_dtypes(include=[np.number])
             self.feature_names = features.columns.tolist()
-            temp_files = []
+            sequence_files = []
             
             with tqdm(total=ddf.npartitions, desc="Processing LSTM batches") as pbar:
                 for partition_idx in range(ddf.npartitions):
                     try:
-                        # Process current partition
                         partition = ddf.get_partition(partition_idx).compute()
                         scaled_data = self.scaler.fit_transform(partition[self.feature_names])
                         
-                        num_sequences = len(scaled_data) - self.sequence_length - self.forecast_horizon + 1
+                        num_sequences = len(scaled_data) - self.sequence_length + 1
                         if num_sequences <= 0:
                             continue
                         
                         sequence_batches = range(0, num_sequences, self.batch_size)
-                        X_parts = []
-                        y_parts = []
-                        rows_processed = 0
+                        current_sequences = []
+                        current_size = 0
+                        max_size = 1024 * 1024 * 1024  # 1GB buffer
                         
-                        with tqdm(sequence_batches, desc=f"Processing sequences for partition {partition_idx + 1}", leave=False) as seq_pbar:
+                        with tqdm(sequence_batches, desc=f"Creating sequences for partition {partition_idx + 1}", leave=False) as seq_pbar:
                             for batch_start in seq_pbar:
                                 batch_end = min(batch_start + self.batch_size, num_sequences)
                                 
@@ -156,40 +169,37 @@ class LSTMModel(BaseModel):
                                     strides=(scaled_data.strides[0], scaled_data.strides[0], scaled_data.strides[1])
                                 )
                                 
-                                y_indices = np.arange(self.sequence_length, self.sequence_length + self.forecast_horizon)
-                                y = scaled_data[y_indices[0]:y_indices[-1] + 1, self.feature_names.index(self.target_variable)]
+                                current_sequences.append(X)
+                                current_size += X.nbytes
                                 
-                                X_parts.append(X)
-                                y_parts.append(y)
-                                rows_processed += X.shape[0]
-                                
-                                if rows_processed >= 500000:
-                                    temp_file = os.path.join(temp_dir, f'temp_sequences_{len(temp_files)}.npz')
-                                    np.savez_compressed(
-                                        temp_file,
-                                        X=np.concatenate(X_parts),
-                                        y=np.concatenate(y_parts)
+                                if current_size >= max_size:
+                                    self._save_sequences_batch(
+                                        current_sequences, 
+                                        temp_dir, 
+                                        len(sequence_files)
                                     )
-                                    temp_files.append(temp_file)
-                                    X_parts = []
-                                    y_parts = []
-                                    rows_processed = 0
+                                    sequence_files.append(
+                                        temp_dir / f'sequences_{len(sequence_files)}.npz'
+                                    )
+                                    current_sequences = []
+                                    current_size = 0
                                     gc.collect()
                                 
                                 seq_pbar.set_postfix({'Memory': f'{psutil.Process().memory_info().rss/1e9:.2f}GB'})
                         
-                        # Save remaining sequences
-                        if X_parts:
-                            temp_file = os.path.join(temp_dir, f'temp_sequences_{len(temp_files)}.npz')
-                            np.savez_compressed(
-                                temp_file,
-                                X=np.concatenate(X_parts),
-                                y=np.concatenate(y_parts)
+                        # Save any remaining sequences
+                        if current_sequences:
+                            self._save_sequences_batch(
+                                current_sequences, 
+                                temp_dir, 
+                                len(sequence_files)
                             )
-                            temp_files.append(temp_file)
+                            sequence_files.append(
+                                temp_dir / f'sequences_{len(sequence_files)}.npz'
+                            )
                         
                         # Cleanup
-                        del scaled_data, X_parts, y_parts
+                        del scaled_data, current_sequences
                         gc.collect()
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
@@ -200,58 +210,101 @@ class LSTMModel(BaseModel):
                     
                     pbar.update(1)
             
-            # Combine all saved sequences
-            self.logger.log_info("Combining processed sequences")
-            final_dataset = None
-
-            batch_size = 33  
-            num_batches = (len(temp_files) + batch_size - 1) // batch_size
-            #print("LEN(TEMP_FILES) AAAAAAAAAAAAAAAAAAAAAA")
-            #print(len(temp_files))
-
-            with tqdm(total=num_batches, desc="Loading processed sequences") as pbar:
-                for i in range(num_batches):
-                    batch_files = temp_files[i * batch_size : (i + 1) * batch_size]
-                    X_batch = []
-                    y_batch = []
-
-                    for temp_file in batch_files:
-                        data = np.load(temp_file)
-                        X_batch.append(torch.FloatTensor(data['X']))
-                        y_batch.append(torch.FloatTensor(data['y']))
-
-                    X_concat = torch.cat(X_batch)
-                    y_concat = torch.cat(y_batch)
-
-                    if final_dataset is None:
-                        final_dataset = TensorDataset(X_concat, y_concat)
-                    else:
-                        final_dataset = TensorDataset(
-                            torch.cat((final_dataset.tensors[0], X_concat)),
-                            torch.cat((final_dataset.tensors[1], y_concat))
-                        )
-
-                    # Clear memory
-                    del X_batch, y_batch, X_concat, y_concat
-                    gc.collect()
-
-                    pbar.update(1)
-            
-            # Cleanup
-            for temp_file in temp_files:
-                if os.path.exists(temp_file):
-                    os.remove(temp_file)
-            os.rmdir(temp_dir)
-            
-            self.logger.log_info("LSTM preprocessing completed")
-            return final_dataset
+            # Create and return streaming dataset
+            return SequenceDataset(
+                str(temp_dir),
+                self.sequence_length,
+                self.batch_size,
+                device=self.device
+            )
             
         except Exception as e:
             self.logger.log_error(f"Error in LSTM preprocessing: {str(e)}")
             raise
+            
+        finally:
+            try:
+                self._cleanup_temp_files(temp_dir)
+            except Exception as e:
+                self.logger.log_warning(f"Cleanup warning: {str(e)}")
+
+    def _save_sequences_batch(self, sequences: List[np.ndarray], temp_dir: Path, batch_idx: int):
+        """Save sequence batch to compressed npz file."""
+        sequences_array = np.concatenate(sequences, axis=0)
+        file_path = temp_dir / f'sequences_{batch_idx}.npz'
+        np.savez_compressed(file_path, X=sequences_array.astype(np.float32))
+        self.temp_files.append(file_path)
+
+    def _cleanup_temp_files(self, temp_dir: Path):
+        """Clean up temporary files and force garbage collection."""
+        try:
+            # Remove temporary npz files
+            for file in self.temp_files:
+                try:
+                    if os.path.exists(file):
+                        os.remove(file)
+                except Exception as e:
+                    self.logger.log_warning(f"Failed to delete {file}: {str(e)}")
+            
+            # Remove memmap file if exists
+            memmap_file = temp_dir / 'sequences.mmap'
+            if memmap_file.exists():
+                try:
+                    memmap_file.unlink()
+                except Exception as e:
+                    self.logger.log_warning(f"Failed to delete memmap file: {str(e)}")
+            
+            # Try to remove temp directory
+            try:
+                if temp_dir.exists():
+                    temp_dir.rmdir()
+            except Exception as e:
+                self.logger.log_warning(f"Failed to remove temp directory: {str(e)}")
+            
+            # Clear lists
+            self.temp_files = []
+            
+            # Force garbage collection
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+        except Exception as e:
+            self.logger.log_error(f"Error during cleanup: {str(e)}")
+
+    def cleanup(self):
+        """Cleanup all resources used by the model."""
+        try:
+            # Clear GPU memory
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            # Remove temp files
+            for file in self.temp_files:
+                try:
+                    if os.path.exists(file):
+                        os.remove(file)
+                except Exception as e:
+                    self.logger.log_warning(f"Failed to remove temp file {file}: {str(e)}")
+            
+            # Clear model artifacts
+            for artifact in self.model_artifacts:
+                if isinstance(artifact, (torch.Tensor, nn.Module)):
+                    del artifact
+            
+            # Reset lists
+            self.temp_files = []
+            self.model_artifacts = []
+            
+            # Force garbage collection
+            gc.collect()
+            
+        except Exception as e:
+            self.logger.log_error(f"Error during cleanup: {str(e)}")
 
     def train(self, train_data: pd.DataFrame, validation_data: Optional[pd.DataFrame] = None, 
           epochs: int = 50, progress_callback: callable = None) -> Dict:
+        """Train model with memory management."""
         try:
             processed_train = self.preprocess_data(train_data)
             processed_val = self.preprocess_data(validation_data) if validation_data is not None else None
@@ -272,13 +325,12 @@ class LSTMModel(BaseModel):
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5)
             
             if self.config['gpu']['optimization']['mixed_precision']:
-                scaler = torch.cuda.amp.GradScaler()
+                scaler = torch.amp.GradScaler()
             
             train_loader = DataLoader(
                 processed_train,
                 batch_size=self.batch_size,
-                shuffle=True,
-                num_workers=0,
+                num_workers=4,
                 pin_memory=False
             )
             
@@ -296,11 +348,11 @@ class LSTMModel(BaseModel):
                 self.model.train()
                 total_loss = 0
                 
-                for X_batch, y_batch in train_loader:
+                for X_batch, y_batch in tqdm(train_loader, desc=f'Epoch {epoch+1}/{epochs}', leave=False):
                     optimizer.zero_grad()
                     
                     if self.config['gpu']['optimization']['mixed_precision']:
-                        with torch.cuda.amp.autocast():
+                        with torch.amp.autocast():
                             outputs, _ = self.model(X_batch)
                             loss = criterion(outputs, y_batch)
                         scaler.scale(loss).backward()
@@ -313,7 +365,7 @@ class LSTMModel(BaseModel):
                         optimizer.step()
                     
                     total_loss += loss.item()
-                
+            
                 avg_loss = total_loss / len(train_loader)
                 training_history['train_loss'].append(avg_loss)
                 
@@ -329,7 +381,7 @@ class LSTMModel(BaseModel):
                         patience_counter = 0
                     else:
                         patience_counter += 1
-                    
+
                     if patience_counter >= patience:
                         self.logger.log_info(f"Early stopping at epoch {epoch}")
                         self._load_best_model()
@@ -353,13 +405,22 @@ class LSTMModel(BaseModel):
         except Exception as e:
             self.logger.log_error(f"Training error: {str(e)}")
             raise
+            
+        finally:
+            # Cleanup resources
+            self.cleanup()
+            if processed_train:
+                del processed_train
+            if processed_val:
+                del processed_val
+            gc.collect()
 
     def _validate(self, validation_data: TensorDataset, criterion: nn.Module) -> float:
         self.model.eval()
         val_loader = DataLoader(
             validation_data,
-            batch_size=self.batch_size,
-            num_workers=0,
+            batch_size=None,  # Batch size handled by dataset
+            num_workers=4,
             pin_memory=False
         )
         
@@ -374,15 +435,12 @@ class LSTMModel(BaseModel):
         return total_loss / len(val_loader)
 
     def predict(self, data: dd.DataFrame, forecast_horizon: Optional[int] = None) -> pd.DataFrame:
-        self.model.eval()
-        forecast_horizon = forecast_horizon or self.forecast_horizon
-        
         try:
             dataset = self.preprocess_data(data)
             dataloader = DataLoader(
                 dataset,
-                batch_size=self.batch_size,
-                num_workers=0,
+                batch_size=None,  # Batch size handled by dataset
+                num_workers=4,
                 pin_memory=False
             )
             
@@ -390,11 +448,11 @@ class LSTMModel(BaseModel):
             prediction_intervals = []
             
             with torch.no_grad():
-                for X_batch, _ in dataloader:
+                for X_batch, _ in tqdm(dataloader, desc="Generating predictions"):
                     mc_predictions = []
-                    self.model.train()
+                    self.model.train()  # Enable dropout for MC sampling
                     
-                    for _ in range(100):
+                    for _ in range(100):  # Monte Carlo samples
                         output, _ = self.model(X_batch)
                         mc_predictions.append(output.cpu().numpy())
                     
@@ -427,6 +485,9 @@ class LSTMModel(BaseModel):
         except Exception as e:
             self.logger.log_error(f"Prediction error: {str(e)}")
             raise
+        
+        finally:
+            self.cleanup()
     
     def _inverse_transform(self, data: np.ndarray) -> np.ndarray:
         """Inverse transform scaled data."""
